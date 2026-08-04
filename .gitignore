@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.env
+.env.*
+
+# Private runtime data. Never commit account or trading records.
+state/
+records/
+journal/
+strategy/reviews/
+*.tmp

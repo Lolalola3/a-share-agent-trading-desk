@@ -1,0 +1,9 @@
+{
+  "command": "python",
+  "args": ["-m", "trading_desk.mcp_server"],
+  "cwd": "/ABSOLUTE/PATH/TO/a-share-agent-trading-desk",
+  "env": {
+    "PYTHONUTF8": "1",
+    "A_SHARE_DESK_HOME": "/PRIVATE/PATH/TO/a-share-desk-runtime"
+  }
+}

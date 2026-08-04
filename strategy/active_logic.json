@@ -1,0 +1,50 @@
+{
+  "version": "1.0.0",
+  "status": "active",
+  "market": "沪深主板A股",
+  "style": "短线波段为主，长期趋势辅助，中低频调仓",
+  "entry": {
+    "candidate_score_min": 65,
+    "technical_confirmation_required": true,
+    "max_change_pct": 5.0,
+    "price_vs_ma20_min": 0.97,
+    "price_vs_ma20_max": 1.04,
+    "volume_ratio_min": 1.0,
+    "avoid_limit_up": true,
+    "sector_must_pass_hard_filter": true
+  },
+  "exit": {
+    "hard_stop_loss_pct": 0.06,
+    "take_profit_1_pct": 0.08,
+    "take_profit_1_sell_fraction": 0.5,
+    "take_profit_2_pct": 0.12,
+    "take_profit_2_sell_fraction": 0.5,
+    "trailing_activate_pct": 0.08,
+    "trailing_stop_from_high_pct": 0.05,
+    "max_holding_trading_days": 15,
+    "sell_only_sellable_shares": true
+  },
+  "t_trade": {
+    "enabled": true,
+    "max_position_fraction": 0.30,
+    "min_expected_profit_pct": 0.02,
+    "support_band_pct": 0.01,
+    "max_support_break_pct": 0.01,
+    "rebound_confirmation_required": true,
+    "low_buy_high_sell_allowed": true,
+    "low_buy_requires_old_sellable_shares_for_later_sell": true
+  },
+  "sizing": {
+    "risk_budget_per_trade_pct": 0.01,
+    "max_position_weight": 1.0,
+    "lot_size": 100
+  },
+  "evolution": {
+    "review_frequency": "每日记录、每周审视、满足门槛后激活",
+    "min_completed_trades_before_activation": 20,
+    "require_out_of_sample_check": true,
+    "require_max_drawdown_not_worse_pct": 0.20,
+    "activate_new_version_next_trading_day": true,
+    "never_change_rules_mid_session": true
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "as_of": "YYYY-MM-DD",
+  "status": "empty",
+  "health": {
+    "status": "empty",
+    "updated_at": null,
+    "reasons": []
+  },
+  "metadata": {},
+  "candidates": [],
+  "history": [],
+  "health_history": []
+}
