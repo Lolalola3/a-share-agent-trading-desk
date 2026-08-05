@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "a-share-agent-trading-desk"
 version = "0.2.1"
-description = "Agent-orchestrated, local-state, analysis-only A-share trading desk"
+description = "Domain-specific Agent Harness for auditable, analysis-only A-share trading workflows"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "Lolalola3"}]

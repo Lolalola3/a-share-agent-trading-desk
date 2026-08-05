@@ -120,6 +120,71 @@ class StateTests(unittest.TestCase):
         self.assertEqual(result["action"], "skip")
         self.assertIn("不是北京时间今天", result["reason"])
 
+    def test_delivery_and_analysis_have_independent_states(self):
+        prepared = state.prepare_node_delivery(
+            "2026-08-05", "11:25", "daily-thread", source_thread_id="scheduler-thread"
+        )
+        self.assertEqual(prepared["delivery"]["status"], "pending")
+        self.assertEqual(prepared["analysis"]["status"], "pending")
+
+        confirmed = state.confirm_node_delivery(
+            "2026-08-05", "11:25", prepared["delivery_id"], "carrier-automation"
+        )
+        self.assertEqual(confirmed["delivery"]["status"], "confirmed")
+        self.assertEqual(confirmed["analysis"]["status"], "pending")
+
+        state.record_run("2026-08-05", "run-simulated", {"summary": "isolated simulation"})
+        completed = state.complete_node_analysis(
+            "2026-08-05", "11:25", prepared["delivery_id"], "run-simulated", summary="ok"
+        )
+        self.assertEqual(completed["delivery"]["status"], "confirmed")
+        self.assertEqual(completed["analysis"]["status"], "completed")
+
+    def test_analysis_cannot_complete_before_delivery_confirmation(self):
+        prepared = state.prepare_node_delivery("2026-08-05", "13:00", "daily-thread")
+        state.record_run("2026-08-05", "run-too-early", {"summary": "isolated simulation"})
+        with self.assertRaises(state.DeskError):
+            state.complete_node_analysis(
+                "2026-08-05", "13:00", prepared["delivery_id"], "run-too-early"
+            )
+
+    def test_failed_delivery_does_not_remain_pending(self):
+        prepared = state.prepare_node_delivery("2026-08-05", "14:25", "archived-thread")
+        failed = state.fail_node_delivery(
+            "2026-08-05", "14:25", prepared["delivery_id"], "target thread archived"
+        )
+        self.assertEqual(failed["delivery"]["status"], "failed")
+        self.assertEqual(failed["analysis"]["status"], "pending")
+        self.assertEqual(failed["delivery"]["failure_reason"], "target thread archived")
+
+    def test_missed_nodes_can_start_daily_task_and_complete_two_later_nodes(self):
+        skipped = state.claim_dispatch_node("2026-08-05", "09:08", datetime(2026, 8, 5, 12, 13))
+        self.assertEqual(skipped["action"], "skip")
+        self.assertEqual(skipped["effective_node"], "11:25")
+
+        first_claim = state.claim_dispatch_node("2026-08-05", "11:25", datetime(2026, 8, 5, 12, 13))
+        self.assertEqual(first_claim["action"], "execute")
+        state.register_task_session("2026-08-05", "sim-daily-thread")
+        first = state.prepare_node_delivery("2026-08-05", "11:25", "sim-daily-thread")
+        state.confirm_node_delivery("2026-08-05", "11:25", first["delivery_id"], "ack:11:25")
+        state.record_run("2026-08-05", "sim-1125", {"summary": "建议一：继续持有观察"})
+        first_done = state.complete_node_analysis(
+            "2026-08-05", "11:25", first["delivery_id"], "sim-1125", summary="建议一已返回"
+        )
+
+        second_claim = state.claim_dispatch_node("2026-08-05", "13:00", datetime(2026, 8, 5, 13, 1))
+        self.assertEqual(second_claim["action"], "execute")
+        second = state.prepare_node_delivery("2026-08-05", "13:00", "sim-daily-thread")
+        state.confirm_node_delivery("2026-08-05", "13:00", second["delivery_id"], "ack:13:00")
+        state.record_run("2026-08-05", "sim-1300", {"summary": "建议二：等待突破确认"})
+        second_done = state.complete_node_analysis(
+            "2026-08-05", "13:00", second["delivery_id"], "sim-1300", summary="建议二已返回"
+        )
+
+        self.assertEqual(first_done["analysis"]["status"], "completed")
+        self.assertEqual(second_done["analysis"]["status"], "completed")
+        self.assertEqual(state.get_task_session("2026-08-05")["thread_id"], "sim-daily-thread")
+
 
 if __name__ == "__main__":
     unittest.main()

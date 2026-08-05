@@ -181,6 +181,139 @@ def get_task_session(day: str) -> dict[str, Any]:
     return session
 
 
+def _node_execution_path(day: str, node: str) -> Path:
+    if node not in SESSION_SCHEDULE:
+        raise DeskError(f"未知调度节点：{node}")
+    return STATE_DIR / "node_executions" / day / f"{node.replace(':', '')}.json"
+
+
+def prepare_node_delivery(
+    day: str,
+    node: str,
+    target_thread_id: str,
+    target_host_id: str = "local",
+    source_thread_id: str = "",
+) -> dict[str, Any]:
+    """Create the durable delivery record before an asynchronous handoff."""
+    if not day or not target_thread_id:
+        raise DeskError("交易日期和目标任务线程 ID 不能为空。")
+    path = _node_execution_path(day, node)
+    existing = _read_json(path)
+    if existing:
+        return existing
+    now = shanghai_now().isoformat(timespec="seconds")
+    execution = {
+        "schema_version": 1,
+        "delivery_id": uuid.uuid4().hex[:16],
+        "day": day,
+        "node": node,
+        "source_thread_id": source_thread_id,
+        "target_thread_id": target_thread_id,
+        "target_host_id": target_host_id,
+        "delivery": {
+            "status": "pending",
+            "prepared_at": now,
+            "confirmed_at": None,
+            "failed_at": None,
+            "transport_id": None,
+            "failure_reason": None,
+        },
+        "analysis": {"status": "pending", "started_at": None, "completed_at": None, "run_id": None, "summary": None},
+        "updated_at": now,
+    }
+    _write_json(path, execution)
+    return execution
+
+
+def confirm_node_delivery(day: str, node: str, delivery_id: str, transport_id: str) -> dict[str, Any]:
+    """Confirm that the asynchronous delivery carrier was created successfully."""
+    path = _node_execution_path(day, node)
+    execution = _read_json(path)
+    if not execution:
+        raise DeskError("节点尚未登记待投递状态。")
+    if execution.get("delivery_id") != delivery_id:
+        raise DeskError("投递 ID 与节点登记不一致。")
+    if execution["delivery"].get("status") == "confirmed":
+        if execution["delivery"].get("transport_id") != transport_id:
+            raise DeskError("节点已由其他投递载体确认，禁止覆盖。")
+        return execution
+    now = shanghai_now().isoformat(timespec="seconds")
+    execution["delivery"].update({"status": "confirmed", "confirmed_at": now, "transport_id": transport_id})
+    execution["updated_at"] = now
+    _write_json(path, execution)
+    return execution
+
+
+def fail_node_delivery(day: str, node: str, delivery_id: str, reason: str) -> dict[str, Any]:
+    """Close a delivery attempt that definitively failed instead of leaving it pending forever."""
+    path = _node_execution_path(day, node)
+    execution = _read_json(path)
+    if not execution:
+        raise DeskError("节点尚未登记待投递状态。")
+    if execution.get("delivery_id") != delivery_id:
+        raise DeskError("投递 ID 与节点登记不一致。")
+    status = execution["delivery"].get("status")
+    if status == "confirmed":
+        raise DeskError("投递已经确认，不能改为失败。")
+    if status == "failed":
+        return execution
+    now = shanghai_now().isoformat(timespec="seconds")
+    execution["delivery"].update({
+        "status": "failed",
+        "failed_at": now,
+        "failure_reason": reason or "投递未确认",
+    })
+    execution["updated_at"] = now
+    _write_json(path, execution)
+    return execution
+
+
+def complete_node_analysis(
+    day: str,
+    node: str,
+    delivery_id: str,
+    run_id: str,
+    status: str = "completed",
+    summary: str = "",
+) -> dict[str, Any]:
+    """Record analysis completion independently from delivery confirmation."""
+    if status not in {"completed", "failed"}:
+        raise DeskError("分析状态必须是 completed 或 failed。")
+    path = _node_execution_path(day, node)
+    execution = _read_json(path)
+    if not execution:
+        raise DeskError("节点尚未登记待投递状态。")
+    if execution.get("delivery_id") != delivery_id:
+        raise DeskError("投递 ID 与节点登记不一致。")
+    if execution["delivery"].get("status") != "confirmed":
+        raise DeskError("投递尚未确认，不能登记分析完成。")
+    if status == "completed" and not list((RECORDS_DIR / "runs" / day).glob(f"*_{run_id}.json")):
+        raise DeskError("未找到对应 analysis_run_record，不能登记分析完成。")
+    if execution["analysis"].get("status") in {"completed", "failed"}:
+        if execution["analysis"].get("run_id") != run_id or execution["analysis"].get("status") != status:
+            raise DeskError("节点分析已经终结，禁止覆盖。")
+        return execution
+    now = shanghai_now().isoformat(timespec="seconds")
+    execution["analysis"].update({
+        "status": status,
+        "started_at": execution["analysis"].get("started_at") or execution["delivery"].get("confirmed_at"),
+        "completed_at": now,
+        "run_id": run_id,
+        "summary": summary,
+    })
+    execution["updated_at"] = now
+    _write_json(path, execution)
+    return execution
+
+
+def get_node_execution_status(day: str, node: str) -> dict[str, Any]:
+    path = _node_execution_path(day, node)
+    execution = _read_json(path)
+    if not execution:
+        return {"day": day, "node": node, "status": "missing"}
+    return execution
+
+
 def claim_dispatch_node(day: str, node: str, current_time: datetime | None = None) -> dict[str, Any]:
     """Atomically allow only the most recent due node to dispatch for a trading day."""
     schedule = list(get_settings().get("session_schedule", SESSION_SCHEDULE))

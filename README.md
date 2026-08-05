@@ -1,8 +1,18 @@
-# A-Share Agent Trading Desk
+# A-Share Trading Agent Harness
 
-一个面向沪深主板的、Agent 编排、本地状态、仅分析不自动下单的交易辅助架构。
+一个面向沪深主板分析场景的领域型 Agent Harness：用 Prompt 协议和 MCP 工具编排 Agent，用确定性程序承接状态、风险、调度与审计，仅生成供人工确认的交易辅助建议。
 
 > 本项目不连接券商，不自动下单，不承诺收益，也不构成投资建议。公开仓库不包含任何真实账户、持仓、现金、候选池、交易记录或任务标识。
+
+## 为什么是 Agent Harness
+
+- **Orchestration**：Scheduler、原子 Dispatcher 和每日唯一分析任务组成可恢复的多节点运行框架。
+- **Tool contract**：MCP stdio server 为账户、候选池、策略检查、订单意图、成交反馈和归档提供结构化接口。
+- **Deterministic state**：资金、股份、T+1、未反馈委托锁定和策略版本由程序维护，不从对话历史推断。
+- **Guardrails**：Agent 的建议必须经过风险规则和状态校验；关键证据不足时拒绝生成新买入或伪精确指令。
+- **Resilience**：节点之间相互独立，重复、过期和未来节点静默跳过；外部数据适配器可替换，单源失败不阻断归档。
+- **Observability**：每次运行保存证据、数据健康、策略检查和用户可见结论，并形成日报、周报与月报。
+- **Human-in-the-loop**：Agent 只创建订单意图，账户仅在用户反馈实际结果后更新。
 
 ## 核心边界
 
@@ -23,7 +33,7 @@ flowchart LR
     U -. manual execution .-> B[Broker]
 ```
 
-## 功能
+## Harness 能力
 
 - 每个交易日复用唯一分析任务，多个时间节点独立触发。
 - 原子节点认领：错过早盘节点不影响后续节点，历史节点不会补发过期指令。
@@ -66,10 +76,11 @@ python -m trading_desk.mcp_server
 - [调度与每日唯一任务](prompts/daily_dispatcher.md)
 - [每周候选池筛选](prompts/weekly_candidate_screen.md)
 
-外部行情技能或 API 不随本仓库提供。接入时应遵守数据采集协议：分类取数、当前节点重新采集、双源核验、限时降级，以及数据不足时拒绝伪精确建议。
+外部行情技能或 API 不随本仓库提供。接入时应遵守数据采集协议：分类取数、当前节点重新采集、腾讯主源成功即停止、失败时限时降级，以及单一合规来源即可进入精确指令流程。
 
 ## 文档
 
+- [Agent Harness 定位](docs/AGENT_HARNESS.md)
 - [架构说明](docs/ARCHITECTURE.md)
 - [自动任务设计](docs/AUTOMATIONS.md)
 - [隐私与安全](SECURITY.md)
