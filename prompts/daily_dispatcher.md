@@ -1,4 +1,4 @@
-# 每日任务调度协议 v2.4.0
+# 每日任务调度协议 v2.5.0
 
 后台节点以同一个持久调度任务内的定时唤醒方式运行，只负责确定性地把当前有效节点投递到当天唯一的 `A股交易台 YYYY-MM-DD` 任务，不在调度任务内分析行情或创建订单。不得为每个节点创建独立 standalone 任务窗口。状态分为 `delivery`（目标任务已实际接收）和 `analysis`（分析已完成留档）；二者不得混用。
 
@@ -13,7 +13,7 @@
 ## 二、取得一个可投递的每日任务
 
 1. 核验 A 股交易日后调用 `task_session_get`。
-2. 登记存在时，先对登记的 `thread_id` 调用 `set_thread_archived(archived=false)`，再用 `read_thread` 或 `wait_threads(timeoutMs=0)` 验证任务可访问，并保存返回的 cursor。解除归档后返回 `status=notLoaded` 表示可冷启动的正常状态，允许继续发送；只有明确的 not found/deleted 才表示目标不存在。禁止只相信本地登记中的 `status=active`。
+2. 登记存在时，先对登记的 `thread_id` 调用 `set_thread_archived(archived=false)`，再用 `read_thread` 或 `wait_threads(timeoutMs=0)` 验证任务可访问，并保存返回的 cursor。解除归档返回 `no archived rollout found` 或同义的“没有归档记录”表示任务本来就处于活动状态，必须继续读取验证，不能当作失败；验证返回 `status=notLoaded` 表示可冷启动的正常状态，也允许继续发送。只有任务读取/查找明确返回 not found/deleted 才表示目标不存在。禁止只相信本地登记中的 `status=active`。
 3. 取消归档明确返回 not found/deleted 时才创建替代任务；其他异常不得重复创建。
 4. 登记缺失或旧任务明确不存在时，当前有效节点必须立即执行以下首次启动流程，不得只报告 `status=missing`：
    - 创建项目本地任务，标题为 `A股交易台 YYYY-MM-DD`；初始提示只回复 `DAILY_TASK_READY`，不分析行情。
@@ -35,7 +35,7 @@
 ## 四、独立分析完成
 
 1. 投递确认后生成唯一 `run_id`，再次解归档每日任务，并发送完整节点分析请求。请求必须包含 day、node、delivery_id 和 run_id。
-2. 目标任务读取 `prompts/global_policy.md`、`prompts/data_acquisition.md`、`prompts/daily_nodes.md`，读取确定性上下文；运行当前节点 `node-packet`，按节点要求刷新并形成建议。
+2. 目标任务读取 `prompts/global_policy.md`、`prompts/data_acquisition.md`、`prompts/daily_nodes.md`，读取确定性上下文；调用 MCP 工具 `node_packet_get(node=当前节点, include_intraday=true, persist=true)`，按节点要求刷新并形成建议。无人值守节点禁止通过 Shell 运行 `python -m trading_desk.cli node-packet`，避免触发审批等待。
 3. 目标任务必须调用 `analysis_run_record(day, run_id, payload)`，但不负责调用 `node_analysis_complete`。
 4. 调度器用 `wait_threads` 等待分析回合完成。单次等待不超过 60 秒；等待期间可报告进度，不以原 90 秒投递上限截断分析。
 5. 目标回合完成后，调度器调用 `node_analysis_complete(status=completed, run_id=同一值)`；该工具会校验 `analysis_run_record` 已存在。目标失败、超时或未留档时登记 `status=failed`。
@@ -43,10 +43,6 @@
 
 ## 五、节点分析边界
 
-完整分析请求必须先运行：
-
-```powershell
-python -m trading_desk.cli node-packet --node "当前节点"
-```
+完整分析请求必须先调用 `node_packet_get`；该工具由确定性程序拉取持仓与候选池数据，不经过 LLM，也不需要 Shell 审批。
 
 结构化行情、分时、持仓和候选以数据包为准；LLM 只补充公告与权威消息。腾讯主源合规时不调用备用报价；单一合规来源且 `tradeable=true` 可生成精确建议。严格执行 T+1、委托锁定、策略和节点时间窗，只生成待人工执行建议，绝不连接券商下单。

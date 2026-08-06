@@ -18,6 +18,7 @@ if hasattr(sys.stdin, "reconfigure"):
 TOOLS = [
     {"name": "account_get", "description": "读取账户主档案，包括资金、可卖股份和未反馈委托锁定。", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "context_get", "description": "读取本次盘面分析必须使用的固定上下文。", "inputSchema": {"type": "object", "properties": {"day": {"type": "string"}}}},
+    {"name": "node_packet_get", "description": "由确定性程序拉取持仓与候选池的节点数据包，避免无人值守任务通过 Shell 触发审批。腾讯合规时立即采用，仅失败时使用备用源。", "inputSchema": {"type": "object", "required": ["node"], "properties": {"node": {"type": "string", "enum": ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]}, "include_intraday": {"type": "boolean"}, "persist": {"type": "boolean"}}}},
     {"name": "dispatch_node_claim", "description": "后台调度任务的第一道时间门禁。按北京时间原子认领截至当前最近的到期节点；过期、未来或重复节点返回skip且不得创建任务。", "inputSchema": {"type": "object", "required": ["day", "node"], "properties": {"day": {"type": "string"}, "node": {"type": "string", "enum": ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]}}}},
     {"name": "task_session_get", "description": "读取指定交易日唯一交易线程的本地登记；用于各独立定时节点复用同一线程。", "inputSchema": {"type": "object", "required": ["day"], "properties": {"day": {"type": "string"}}}},
     {"name": "task_session_register", "description": "登记指定交易日的唯一交易线程。默认拒绝覆盖其他线程；仅确认旧线程失效后才可 replace。", "inputSchema": {"type": "object", "required": ["day", "thread_id"], "properties": {"day": {"type": "string"}, "thread_id": {"type": "string"}, "host_id": {"type": "string"}, "title": {"type": "string"}, "source": {"type": "string"}, "replace": {"type": "boolean"}}}},
@@ -48,9 +49,18 @@ TOOLS = [
 
 
 def call_tool(name: str, args: dict[str, Any]) -> Any:
+    def build_node_packet() -> dict[str, Any]:
+        from .market_packet import MarketPacketBuilder
+        return MarketPacketBuilder().build(
+            args["node"],
+            include_intraday=bool(args.get("include_intraday", True)),
+            persist=bool(args.get("persist", True)),
+        )
+
     handlers: dict[str, Callable[[], Any]] = {
         "account_get": state.get_account,
         "context_get": lambda: state.context_pack(args.get("day")),
+        "node_packet_get": build_node_packet,
         "dispatch_node_claim": lambda: state.claim_dispatch_node(args["day"], args["node"]),
         "task_session_get": lambda: state.get_task_session(args["day"]),
         "task_session_register": lambda: state.register_task_session(args["day"], args["thread_id"], args.get("host_id", "local"), args.get("title", ""), args.get("source", "scheduled_node"), bool(args.get("replace", False))),
