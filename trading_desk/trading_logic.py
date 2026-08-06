@@ -8,13 +8,30 @@ from typing import Any
 from . import state
 
 
-LOGIC_PATH = state.ROOT / "strategy" / "active_logic.json"
+LOGIC_PATH = state.PACKAGE_ROOT / "strategy" / "active_logic.json"
 
 
 def load_logic() -> dict[str, Any]:
     if not LOGIC_PATH.exists():
         raise state.DeskError("交易逻辑文件不存在，不能生成交易判断。")
     return json.loads(LOGIC_PATH.read_text(encoding="utf-8"))
+
+
+def format_trade_instruction(order: dict[str, Any]) -> str:
+    """Return the only accepted five-field user-facing order sentence."""
+    side = {"buy": "买", "sell": "卖"}.get(str(order.get("side")))
+    if side is None:
+        raise ValueError("交易方向必须是 buy 或 sell。")
+    valid_from = str(order.get("valid_from", "")).strip()
+    valid_until = str(order.get("valid_until", "")).strip()
+    deadline = str(order.get("feedback_deadline", "")).strip()
+    if not valid_from or not valid_until or not deadline:
+        raise ValueError("交易时间与反馈等待时间不能为空。")
+    code = str(order.get("code", "")).strip()
+    name = str(order.get("name", "")).strip()
+    price = float(order["limit_price"])
+    shares = int(order.get("requested_shares", order.get("shares", 0)))
+    return f"{valid_from}-{valid_until}，{code} {name}，{side} {price:.3f} 元，{shares} 股，等待反馈至 {deadline}"
 
 
 def _floor_lot(shares: float, lot_size: int) -> int:

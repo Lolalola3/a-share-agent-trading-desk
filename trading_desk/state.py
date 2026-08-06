@@ -16,7 +16,10 @@ JOURNAL_DIR = ROOT / "journal"
 ACCOUNT_PATH = STATE_DIR / "account.json"
 WATCHLIST_PATH = STATE_DIR / "watchlist.json"
 SETTINGS_PATH = STATE_DIR / "settings.json"
+# Deprecated compatibility constant.  The dynamic runtime does not read or
+# expose these fixed nodes; old journal records may still contain them.
 SESSION_SCHEDULE = ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]
+SECTOR_UNIVERSE_PATH = STATE_DIR / "sector_universe.json"
 DISPATCH_CLAIM_LEASE_SECONDS = 180
 
 
@@ -60,9 +63,13 @@ def default_settings() -> dict[str, Any]:
         "t_trade_max_fraction": 0.30,
         "replacement_score_gap": 15,
         "allowed_code_prefixes": ["600", "601", "603", "605", "000", "001", "002", "003"],
-        "session_schedule": SESSION_SCHEDULE,
+        "analysis_runtime": {
+            "mode": "first_open_then_resettable_timer",
+            "analysis_interval_minutes": 60,
+            "heartbeat_interval_minutes": 5,
+        },
         "mandatory_context_days": 5,
-        "prompt_workflow_version": "4.0.0",
+        "prompt_workflow_version": "5.1.0",
         "candidate_pool": {
             "frequency": "每周日 17:00，必要时盘后应急重筛",
             "sector_count": 5,
@@ -109,6 +116,7 @@ def initialize(initial_date: str, available_cash: float, positions: list[dict[st
             "today_bought_shares": shares,
             "cost": round(float(position["cost"]), 4),
             "opened_on": initial_date,
+            "sector": str(position.get("sector", "")),
         })
     account = {
         "schema_version": 1,
@@ -182,6 +190,111 @@ def get_task_session(day: str) -> dict[str, Any]:
     return session
 
 
+def get_sector_universe() -> dict[str, Any]:
+    return _read_json(STATE_DIR / "sector_universe.json", {
+        "schema_version": 1,
+        "status": "empty",
+        "as_of": None,
+        "valid_until": None,
+        "updated_at": None,
+        "sources": [],
+        "sectors": [],
+    })
+
+
+def update_sector_universe(
+    sectors: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    as_of: str,
+    valid_until: str,
+    rationale: str,
+) -> dict[str, Any]:
+    """Persist an audited sector-constituent snapshot for Tencent proxy math.
+
+    This function never fetches a sector source.  The weekly screening Agent
+    must submit the exact observed source timestamps and constituent codes.
+    Intraday code only consumes this immutable snapshot.
+    """
+    if not 1 <= len(sectors) <= 5:
+        raise DeskError("板块快照必须包含 1 至 5 个板块。")
+    if date.fromisoformat(valid_until) < date.fromisoformat(as_of):
+        raise DeskError("板块快照有效期不能早于数据日期。")
+    if not sources:
+        raise DeskError("板块快照缺少可审计的数据来源。")
+    normalized_sources = []
+    for source in sources:
+        required = ("name", "captured_at", "data_as_of", "status", "completeness_ratio", "consecutive_successes")
+        if any(field not in source or source.get(field) is None or source.get(field) == "" for field in required):
+            raise DeskError("板块来源必须包含名称、时点、数据日期、状态、完整度和连续成功次数。")
+        try:
+            captured_at = datetime.fromisoformat(str(source["captured_at"]))
+            source_day = date.fromisoformat(str(source["data_as_of"]))
+            completeness = float(source["completeness_ratio"])
+            consecutive_successes = int(source["consecutive_successes"])
+        except (TypeError, ValueError) as exc:
+            raise DeskError("板块来源的日期、完整度或连续成功次数格式无效。") from exc
+        if captured_at.tzinfo is None:
+            raise DeskError("板块来源 captured_at 必须包含时区。")
+        status = str(source["status"])
+        if status not in {"online", "degraded", "offline"}:
+            raise DeskError("板块来源状态必须是 online、degraded 或 offline。")
+        if status == "online" and (
+            source_day != date.fromisoformat(as_of)
+            or completeness < 0.95
+            or consecutive_successes < 2
+        ):
+            raise DeskError("online 板块来源必须同日、完整度至少95%，且连续成功至少2次。")
+        normalized_sources.append({
+            "name": str(source["name"]),
+            "captured_at": captured_at.isoformat(timespec="seconds"),
+            "data_as_of": source_day.isoformat(),
+            "status": status,
+            "completeness_ratio": round(completeness, 4),
+            "consecutive_successes": consecutive_successes,
+            "note": str(source.get("note", "")),
+        })
+    if not any(item["status"] == "online" for item in normalized_sources):
+        raise DeskError("板块快照至少需要一个状态为 online 的已核验来源。")
+    normalized_sectors = []
+    seen_names: set[str] = set()
+    for item in sectors:
+        name = str(item.get("name", "")).strip()
+        if not name or name in seen_names:
+            raise DeskError("板块名称不能为空或重复。")
+        seen_names.add(name)
+        raw_constituents = item.get("constituents")
+        if not isinstance(raw_constituents, list) or len(raw_constituents) < 3:
+            raise DeskError(f"板块 {name} 至少需要 3 只成分股。")
+        constituents = []
+        seen_codes: set[str] = set()
+        for member in raw_constituents:
+            code = str(member.get("code", ""))
+            if not _is_mainboard_code(code):
+                raise DeskError(f"{name} 的成分股 {code} 不在沪深主板范围。")
+            if code in seen_codes:
+                raise DeskError(f"{name} 的成分股 {code} 重复。")
+            seen_codes.add(code)
+            constituents.append({"code": code, "name": str(member.get("name", ""))})
+        normalized_sectors.append({
+            "name": name,
+            "constituents": constituents,
+            "constituent_count": len(constituents),
+        })
+    payload = {
+        "schema_version": 1,
+        "status": "active",
+        "as_of": as_of,
+        "valid_until": valid_until,
+        "updated_at": shanghai_now().isoformat(timespec="seconds"),
+        "rationale": str(rationale),
+        "sources": normalized_sources,
+        "sectors": normalized_sectors,
+    }
+    _write_json(STATE_DIR / "sector_universe.json", payload)
+    append_daily(as_of, "sector_universe_updated", payload)
+    return payload
+
+
 def _node_execution_path(day: str, node: str) -> Path:
     if node not in SESSION_SCHEDULE:
         raise DeskError(f"未知调度节点：{node}")
@@ -227,7 +340,7 @@ def prepare_node_delivery(
 
 
 def confirm_node_delivery(day: str, node: str, delivery_id: str, transport_id: str) -> dict[str, Any]:
-    """Confirm that the asynchronous delivery carrier was created successfully."""
+    """Confirm that the target task started the delivered analysis turn."""
     path = _node_execution_path(day, node)
     execution = _read_json(path)
     if not execution:
@@ -509,6 +622,7 @@ def create_order_intent(
     valid_from: str,
     valid_until: str,
     reason: str,
+    feedback_deadline: str,
     run_id: str | None = None,
 ) -> dict[str, Any]:
     account = get_account()
@@ -521,6 +635,8 @@ def create_order_intent(
         raise DeskError("股数必须是正的 100 股整数倍。")
     if limit_price <= 0:
         raise DeskError("限价必须大于 0。")
+    if not feedback_deadline:
+        raise DeskError("必须提供成交反馈等待截止时间。")
     order_id = uuid.uuid4().hex[:12]
     order = {
         "id": order_id,
@@ -532,6 +648,7 @@ def create_order_intent(
         "filled_shares": 0,
         "valid_from": valid_from,
         "valid_until": valid_until,
+        "feedback_deadline": feedback_deadline,
         "reason": reason,
         "run_id": run_id,
         "status": "pending_feedback",
@@ -543,6 +660,7 @@ def create_order_intent(
     risk_entry = float(position_for_risk["cost"]) if side == "sell" and position_for_risk else limit_price
     order["strategy_version"] = trading_logic.load_logic()["version"]
     order["risk_levels"] = trading_logic.exit_levels(risk_entry)
+    order["instruction_line"] = trading_logic.format_trade_instruction(order)
     if side == "buy":
         reservation = round(limit_price * shares * 1.001, 2)
         if account["cash_available"] + 0.005 < reservation:
@@ -610,6 +728,7 @@ def record_trade_feedback(
                     "code": order["code"], "name": order["name"], "shares": filled_shares,
                     "sellable_shares": 0, "today_bought_shares": filled_shares,
                     "cost": round(actual / filled_shares, 4), "opened_on": account["as_of"],
+                    "sector": "",
                 })
     else:
         position = _find_position(account, order["code"])
@@ -653,6 +772,7 @@ def reconcile_account(
             "code": str(position["code"]), "name": str(position["name"]), "shares": shares,
             "sellable_shares": sellable, "today_bought_shares": today_bought,
             "cost": round(float(position["cost"]), 4), "opened_on": str(position.get("opened_on", as_of)),
+            "sector": str(position.get("sector", "")),
         })
     account.update({
         "as_of": as_of, "cash_available": round(float(available_cash), 2), "cash_frozen": 0.0,
@@ -837,6 +957,7 @@ def append_daily(day: str, event_type: str, payload: dict[str, Any]) -> Path:
         "day_rollover": "交易日滚动",
         "watchlist_updated": "候选池更新",
         "watchlist_health": "候选池健康检查",
+        "sector_universe_updated": "板块成分快照更新",
         "market_run": "盘面分析",
     }
     with path.open("a", encoding="utf-8") as handle:
@@ -866,6 +987,7 @@ def context_pack(day: str | None = None) -> dict[str, Any]:
     account = get_account()
     settings = get_settings()
     watchlist = get_watchlist()
+    sector_universe = get_sector_universe()
     current_day = day or account["as_of"]
     daily_files = sorted((JOURNAL_DIR / "daily").glob("*.md"), reverse=True)[:settings["mandatory_context_days"]]
     return {
@@ -873,6 +995,7 @@ def context_pack(day: str | None = None) -> dict[str, Any]:
         "account": account,
         "settings": settings,
         "watchlist": watchlist,
+        "sector_universe": sector_universe,
         "task_session": get_task_session(current_day),
         "candidate_pool_policy": {
             "frequency": settings["candidate_pool"]["frequency"],
@@ -883,9 +1006,9 @@ def context_pack(day: str | None = None) -> dict[str, Any]:
         },
         "mandatory_daily_files": [str(path) for path in daily_files],
         "instruction_policy": {
-            "analysis_start": "T 时刻开始分析",
-            "last_refresh": "T+4 分钟最后刷新行情",
-            "execution_window": "T+5 至 T+10 分钟执行",
+            "required_format": "时间，股票，买/卖精确价格，买卖数量，反馈等待时间",
+            "analysis_start": "分析触发时刻开始取数",
+            "execution_window": "每条建议必须给出明确有效时段",
             "no_feedback": "没有反馈时继续锁定资金或股份，后续分析不得重复使用。",
         },
     }

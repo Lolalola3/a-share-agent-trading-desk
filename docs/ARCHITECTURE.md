@@ -1,47 +1,26 @@
-# Architecture
+# Architecture v5.1
 
-## Design goal
+## Components
 
-构建一个面向高风险、时序敏感任务的领域型 Agent Harness：把结构化行情采集和指标计算交给确定性程序，把消息增量、解释和判断交给 Agent；资金、股份、T+1、风险规则、任务幂等性和审计同样由程序维护。系统不自动连接券商。
+1. **Session bootstrap**：SessionStart hook 注入幂等启动要求；工作日 cron 只作为兜底。登记可访问时复用唯一日任务，明确失效时才允许替换。
+2. **Dynamic runtime**：`analysis_runtime_poll` 原子处理首次、60 分钟到期、用户请求、监控信号、收盘和收盘修订；15 分钟 lease 防止重复分析。
+3. **Tencent packet**：持仓、候选、指数和已审计板块成分股批量取数；技术、相对强弱和板块代理在本地确定性计算。
+4. **Monitoring**：Agent 每轮选择模板、股票、指标和阈值。crossing、cooldown 和 rearm 防止信号重复；信号只触发再分析。
+5. **Deterministic state**：账户、T+1、现金/股份锁定、候选池、板块快照和审计文件不依赖对话记忆。
+6. **Close gate**：必须依次完成新收盘分析、全天复核和次日展望，并以同一 `close_review` 写入 run 与 report；一致性失败时拒绝关闭。
 
-Harness 的职责不是替代模型或行情服务，而是约束一次 Agent 运行如何获取上下文、调用工具、处理失败、形成建议、接收人工反馈并留下可复核记录。
+## Contracts
 
-## Layers
+- **Data contract**：盘中实时数据只认腾讯；失败即不可交易，不自动回退。
+- **Sector contract**：成员来源同日、完整度≥95%、连续成功≥2；盘中覆盖不足则板块硬条件不可用。
+- **Order contract**：建议不等于下单。真实建议必须先登记订单意图，用户反馈后才改变账户。
+- **Timer contract**：每次完整分析完成后重置 60 分钟；收盘归档成功后 `next_analysis_at=null`。
+- **Privacy contract**：公开代码与 `A_SHARE_DESK_HOME` 私有状态隔离。
 
-1. **Scheduler**：八个简单单时点 standalone 自动化分别创建短生命周期节点任务，不复用跨日调度窗口。
-2. **Node gate**：每个节点按实际北京时间回溯最近到期时刻，通过带180秒租约的 `dispatch_node_claim` 原子去重；当天首个有效节点创建并登记当日分析任务。
-3. **Market packet**：程序批量拉报价，并发拉分时/日K，使用日缓存和本地确定性指标构造数据包。
-4. **Analysis Agent**：只补充少量公告/权威消息，解释数据包，形成操作或不操作结论。
-5. **MCP core**：执行投递/分析双状态校验、T+1、风险计算、订单意图锁定、反馈更新和审计写入；只有分析留档后才能登记 `analysis=completed`。
-6. **Private runtime**：保存账户、候选池、行情缓存、运行记录和日报；默认不进入版本控制。
+## Failure behavior
 
-## Harness contracts
-
-- **Context contract**：每个节点显式读取账户、候选池和活动策略，不把聊天记忆作为状态事实来源。
-- **Tool contract**：所有状态变更通过带 JSON Schema 的 MCP 工具完成；Agent 不能直接绕过 T+1、订单锁定和策略检查。
-- **Scheduling contract**：`dispatch_node_claim` 只放行截至当前最近的到期节点；重复、过期或未来节点返回 skip。
-- **Execution contract**：订单意图只是一条待人工执行的结构化建议，不会提交到券商；成交反馈是账户更新的唯一入口。
-- **Audit contract**：每个节点无论是否产生交易建议，都必须写入数据健康、证据、策略检查和最终结论。
-
-## Failure model
-
-- 每个节点独立，前序节点失败不阻断下一节点。
-- 本地任务登记不是 Codex 任务运行状态的事实来源；每次投递必须实际解归档并验证目标可访问。解除归档返回 `no archived rollout found` 表示目标已经处于活动状态；验证后的 `notLoaded` 是可接收新消息并冷启动的正常状态，二者都不等同于任务缺失。
-- ACK 后由节点任务确认投递；当日分析任务留档后自行登记分析完成，二者互不替代。
-- 单个行情来源、脚本或网站不是系统前置条件。
-- 实时报价必须在当前节点重新采集；历史失败不能替代当前备用源调用。
-- 数据不完整时仍完成风险观察与归档，但不生成新买入或伪精确指令。
-- 未反馈订单持续锁定资金或股份，防止后续节点基于错误余额继续建议。
-
-## State ownership
-
-`A_SHARE_DESK_HOME` 是运行状态根目录。核心模块只在该目录写入：
-
-```text
-state/      account, candidate pool, node claims, task sessions
-records/    analysis evidence, intents, feedback, strategy reviews
-journal/    daily, weekly and monthly reports
-strategy/   optional runtime strategy override and review proposals
-```
-
-代码仓库只包含策略模板、Prompt和程序，不包含上述真实运行数据。
+- stale/invalid Tencent quote：观察，不生成精确交易建议。
+- stale task registration：先验证任务；只有明确 not found 才替换。
+- expired analysis lease：记录 expired 后允许下一轮重新认领。
+- incomplete close review：拒绝 `reports_close_day` 或 `analysis_cycle_complete(close_session=true)`。
+- user-requested close correction：`source=close_revision, force=true` 重新拉数据并重做三段式流程。

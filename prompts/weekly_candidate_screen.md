@@ -1,5 +1,9 @@
 # 周候选池筛选 v2.0.0
 
+筛选完成时必须调用 `sector_universe_update` 保存入选板块的完整沪深主板成分股快照。每个来源都要写明 name、带时区的 captured_at、data_as_of、status、completeness_ratio、consecutive_successes；至少一个来源必须与快照同日、完整度不低于95%、连续成功至少2次，才可标为 online。来源不稳定或成分不完整时，不更新旧快照，并冻结依赖板块硬条件的新买入。
+
+盘中不会再次查询这些来源，只会基于该快照和腾讯批量实时行情计算板块代理。东方财富、同花顺、DangInvest 的结果不得因“能返回一次”就视为稳定。
+
 每周日17:00运行；初次启用或候选池失效时可在盘后补跑。读取 `prompts/global_policy.md` 并严格执行。
 
 ## 筛选漏斗

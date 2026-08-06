@@ -7,7 +7,8 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from . import reports, state, trading_logic
+from . import monitoring, reports, runtime, state, trading_logic
+from .market_packet import MarketPacketBuilder
 
 
 if hasattr(sys.stdin, "reconfigure"):
@@ -20,10 +21,6 @@ TOOLS = [
     {"name": "account_get", "description": "读取账户主档案，包括资金、可卖股份和未反馈委托锁定。", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "context_get", "description": "读取本次盘面分析必须使用的固定上下文。", "inputSchema": {"type": "object", "properties": {"day": {"type": "string"}}}},
     {"name": "analysis_protocol_get", "description": "一次性读取无人值守节点所需的四份提示协议和当前策略，避免通过 Shell 读取本地文件而触发审批。", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "node_packet_get", "description": "由确定性程序拉取持仓与候选池的节点数据包，避免无人值守任务通过 Shell 触发审批。腾讯合规时立即采用，仅失败时使用备用源。", "inputSchema": {"type": "object", "required": ["node"], "properties": {"node": {"type": "string", "enum": ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]}, "include_intraday": {"type": "boolean"}, "persist": {"type": "boolean"}}}},
-    {"name": "dispatch_node_claim", "description": "后台调度任务的第一道时间门禁。按北京时间原子认领截至当前最近的到期节点；过期、未来或重复节点返回skip且不得创建任务。", "inputSchema": {"type": "object", "required": ["day", "node"], "properties": {"day": {"type": "string"}, "node": {"type": "string", "enum": ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]}}}},
-    {"name": "task_session_get", "description": "读取指定交易日唯一交易线程的本地登记；用于各独立定时节点复用同一线程。", "inputSchema": {"type": "object", "required": ["day"], "properties": {"day": {"type": "string"}}}},
-    {"name": "task_session_register", "description": "登记指定交易日的唯一交易线程。默认拒绝覆盖其他线程；仅确认旧线程失效后才可 replace。", "inputSchema": {"type": "object", "required": ["day", "thread_id"], "properties": {"day": {"type": "string"}, "thread_id": {"type": "string"}, "host_id": {"type": "string"}, "title": {"type": "string"}, "source": {"type": "string"}, "replace": {"type": "boolean"}}}},
     {"name": "order_intent_create", "description": "登记一笔精确的、不会自动提交的限价买卖指令，并锁定资金或可卖股份。", "inputSchema": {"type": "object", "required": ["code", "name", "side", "limit_price", "shares", "valid_from", "valid_until", "reason"], "properties": {"code": {"type": "string"}, "name": {"type": "string"}, "side": {"type": "string", "enum": ["buy", "sell"]}, "limit_price": {"type": "number"}, "shares": {"type": "integer"}, "valid_from": {"type": "string"}, "valid_until": {"type": "string"}, "reason": {"type": "string"}, "run_id": {"type": "string"}}}},
     {"name": "trade_feedback_record", "description": "记录用户实际成交、部分成交或撤单，并更新资金和 T+1 可卖数量。", "inputSchema": {"type": "object", "required": ["order_id", "status"], "properties": {"order_id": {"type": "string"}, "status": {"type": "string", "enum": ["filled", "partial", "cancelled"]}, "filled_shares": {"type": "integer"}, "fill_price": {"type": "number"}, "fees": {"type": "number"}}}},
     {"name": "account_reconcile", "description": "所有委托反馈完成后，按用户提供的券商数据进行盘后账户核对。", "inputSchema": {"type": "object", "required": ["as_of", "available_cash", "positions", "note"], "properties": {"as_of": {"type": "string"}, "available_cash": {"type": "number"}, "positions": {"type": "array"}, "note": {"type": "string"}}}},
@@ -32,12 +29,7 @@ TOOLS = [
     {"name": "candidate_pool_update", "description": "保存由大模型按周筛 Prompt 完成并通过结构校验的最多五只候选股；失败时不覆盖旧池。", "inputSchema": {"type": "object", "required": ["candidates", "rationale"], "properties": {"candidates": {"type": "array", "minItems": 1, "maxItems": 5}, "rationale": {"type": "string"}, "as_of": {"type": "string"}, "metadata": {"type": "object"}}}},
     {"name": "candidate_pool_health_record", "description": "记录工作日候选池健康状态及是否冻结新买入或触发盘后应急重筛。", "inputSchema": {"type": "object", "required": ["status", "reasons", "metrics", "action"], "properties": {"status": {"type": "string", "enum": ["normal", "watch", "frozen", "invalidated"]}, "reasons": {"type": "array", "items": {"type": "string"}}, "metrics": {"type": "object"}, "action": {"type": "string"}, "as_of": {"type": "string"}}}},
     {"name": "analysis_run_record", "description": "保存一次定时分析的证据、结论和中文用户可见文本。", "inputSchema": {"type": "object", "required": ["day", "run_id", "payload"], "properties": {"day": {"type": "string"}, "run_id": {"type": "string"}, "payload": {"type": "object"}}}},
-    {"name": "node_delivery_prepare", "description": "在异步投递前创建节点执行记录；投递与分析状态均为 pending。", "inputSchema": {"type": "object", "required": ["day", "node", "target_thread_id"], "properties": {"day": {"type": "string"}, "node": {"type": "string", "enum": ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]}, "target_thread_id": {"type": "string"}, "target_host_id": {"type": "string"}, "source_thread_id": {"type": "string"}}}},
-    {"name": "node_delivery_confirm", "description": "异步任务载体创建成功后，仅确认投递成功，不代表分析已完成。", "inputSchema": {"type": "object", "required": ["day", "node", "delivery_id", "transport_id"], "properties": {"day": {"type": "string"}, "node": {"type": "string"}, "delivery_id": {"type": "string"}, "transport_id": {"type": "string"}}}},
-    {"name": "node_delivery_fail", "description": "确认投递无法完成时登记 failed，避免节点永久停留在 pending。", "inputSchema": {"type": "object", "required": ["day", "node", "delivery_id", "reason"], "properties": {"day": {"type": "string"}, "node": {"type": "string"}, "delivery_id": {"type": "string"}, "reason": {"type": "string"}}}},
-    {"name": "node_analysis_complete", "description": "分析任务完成留档后，独立登记 completed 或 failed 状态。", "inputSchema": {"type": "object", "required": ["day", "node", "delivery_id", "run_id"], "properties": {"day": {"type": "string"}, "node": {"type": "string"}, "delivery_id": {"type": "string"}, "run_id": {"type": "string"}, "status": {"type": "string", "enum": ["completed", "failed"]}, "summary": {"type": "string"}}}},
-    {"name": "node_execution_status_get", "description": "分别读取指定节点的投递状态和分析状态。", "inputSchema": {"type": "object", "required": ["day", "node"], "properties": {"day": {"type": "string"}, "node": {"type": "string"}}}},
-    {"name": "reports_close_day", "description": "收盘后生成日报交接包、周报和月报。", "inputSchema": {"type": "object", "required": ["day"], "properties": {"day": {"type": "string"}, "note": {"type": "string"}}}},
+    {"name": "reports_close_day", "description": "校验并归档收盘时点完整分析、当日记录复核和次日建议预期，再生成日报交接包、周报和月报。", "inputSchema": {"type": "object", "required": ["day", "run_id", "review"], "properties": {"day": {"type": "string"}, "run_id": {"type": "string"}, "review": {"type": "object"}, "note": {"type": "string"}}}},
     {"name": "strategy_logic_get", "description": "读取当前版本的数字化交易逻辑，包括止损止盈、入场与 T 的硬性规则。", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "strategy_entry_check", "description": "按照当前固定规则检查候选股是否允许入场，不直接下单。", "inputSchema": {"type": "object", "required": ["snapshot"], "properties": {"snapshot": {"type": "object"}}}},
     {"name": "strategy_exit_check", "description": "根据成本、现价和最高收盘价检查固定止损、止盈和移动止盈触发，并返回明确价格。", "inputSchema": {"type": "object", "required": ["position", "current_price"], "properties": {"position": {"type": "object"}, "current_price": {"type": "number"}, "highest_close": {"type": "number"}}}},
@@ -49,37 +41,54 @@ TOOLS = [
     {"name": "strategy_review_record", "description": "记录每日或每周策略复盘、观察和候选规则变更；只生成提案，不修改当前盘中规则。", "inputSchema": {"type": "object", "required": ["as_of", "scope", "completed_trades", "out_of_sample_ok", "drawdown_worse_fraction", "observations", "proposed_changes"], "properties": {"as_of": {"type": "string"}, "scope": {"type": "string"}, "completed_trades": {"type": "integer"}, "out_of_sample_ok": {"type": "boolean"}, "drawdown_worse_fraction": {"type": "number"}, "observations": {"type": "array", "items": {"type": "string"}}, "proposed_changes": {"type": "array", "items": {"type": "string"}}}}},
 ]
 
+# Replace the v4 order schema with the strict five-field v5 schema below.
+TOOLS = [tool for tool in TOOLS if tool["name"] != "order_intent_create"]
+TOOLS[2]["description"] = "读取动态日任务、腾讯数据、监控和收盘归档协议及当前策略。"
+TOOLS.extend([
+    {"name": "analysis_packet_get", "description": "拉取持仓、候选池、大盘及板块代理数据。盘中仅使用腾讯，失败即不可交易。", "inputSchema": {"type": "object", "properties": {"trigger": {"type": "string"}, "include_intraday": {"type": "boolean"}, "persist": {"type": "boolean"}}}},
+    {"name": "daily_session_get", "description": "读取当日唯一交易任务及可重置一小时计时器状态。", "inputSchema": {"type": "object", "required": ["day"], "properties": {"day": {"type": "string"}}}},
+    {"name": "daily_session_register", "description": "登记当日唯一交易任务；默认拒绝重复任务。", "inputSchema": {"type": "object", "required": ["day", "thread_id"], "properties": {"day": {"type": "string"}, "thread_id": {"type": "string"}, "host_id": {"type": "string"}, "title": {"type": "string"}, "source": {"type": "string"}, "replace": {"type": "boolean"}}}},
+    {"name": "daily_session_heartbeat_register", "description": "登记当日唯一心跳自动化 ID。心跳只轮询；完整分析仍按一小时、手动、监控或收盘触发。", "inputSchema": {"type": "object", "required": ["day", "automation_id"], "properties": {"day": {"type": "string"}, "automation_id": {"type": "string"}}}},
+    {"name": "analysis_runtime_poll", "description": "原子检查首次、计时器、监控和收盘触发，返回 analyze/skip/bootstrap。", "inputSchema": {"type": "object", "required": ["day"], "properties": {"day": {"type": "string"}, "source": {"type": "string"}, "force": {"type": "boolean"}}}},
+    {"name": "analysis_cycle_complete", "description": "分析留档后完成当前周期并重置一小时计时器；收盘归档后关闭计时器。", "inputSchema": {"type": "object", "required": ["day", "run_id", "status", "summary"], "properties": {"day": {"type": "string"}, "run_id": {"type": "string"}, "status": {"type": "string", "enum": ["completed", "failed"]}, "summary": {"type": "string"}, "close_session": {"type": "boolean"}}}},
+    {"name": "monitor_templates_get", "description": "读取 Agent 可选择的监控程序模板和参数说明。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "monitor_plan_get", "description": "读取当日启用的监控规则。", "inputSchema": {"type": "object", "required": ["day"], "properties": {"day": {"type": "string"}}}},
+    {"name": "monitor_plan_apply", "description": "分析后由 Agent 选择启用、修改或清空监控；只能监控持仓和候选池。", "inputSchema": {"type": "object", "required": ["day", "monitors", "rationale"], "properties": {"day": {"type": "string"}, "monitors": {"type": "array"}, "rationale": {"type": "string"}}}},
+    {"name": "sector_universe_get", "description": "读取周筛时保存的已审计板块成分股快照。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "sector_universe_update", "description": "保存来源、时间和成分代码均可审计的板块快照，供盘中腾讯行情本地计算。", "inputSchema": {"type": "object", "required": ["sectors", "sources", "as_of", "valid_until", "rationale"], "properties": {"sectors": {"type": "array", "minItems": 1, "maxItems": 5}, "sources": {"type": "array", "minItems": 1}, "as_of": {"type": "string"}, "valid_until": {"type": "string"}, "rationale": {"type": "string"}}}},
+    {"name": "order_intent_create", "description": "登记不自动提交的精确限价建议并锁定资金或股份；返回严格五字段 instruction_line。", "inputSchema": {"type": "object", "required": ["code", "name", "side", "limit_price", "shares", "valid_from", "valid_until", "feedback_deadline", "reason"], "properties": {"code": {"type": "string"}, "name": {"type": "string"}, "side": {"type": "string", "enum": ["buy", "sell"]}, "limit_price": {"type": "number"}, "shares": {"type": "integer"}, "valid_from": {"type": "string"}, "valid_until": {"type": "string"}, "feedback_deadline": {"type": "string"}, "reason": {"type": "string"}, "run_id": {"type": "string"}}}},
+])
+
 
 def analysis_protocol_pack() -> dict[str, Any]:
-    prompt_root = Path(__file__).resolve().parent.parent / "prompts"
-    names = ("daily_dispatcher.md", "global_policy.md", "data_acquisition.md", "daily_nodes.md")
+    prompt_root = state.PACKAGE_ROOT / "prompts"
+    names = ("session_bootstrap.md", "global_policy.md", "data_acquisition.md", "daily_session.md", "monitoring.md", "weekly_candidate_screen.md")
     return {
-        "prompt_workflow_version": "4.0.0",
+        "prompt_workflow_version": "5.1.0",
         "runtime_setting_version": state.get_settings().get("prompt_workflow_version"),
         "prompts": {name: (prompt_root / name).read_text(encoding="utf-8") for name in names},
         "strategy": trading_logic.load_logic(),
-        "instruction": "本工具是无人值守任务的协议入口；不得再用 Shell 读取这四个文件。",
+        "instruction": "本工具是动态日任务的协议入口；不得再用 Shell 重复读取这些文件。",
     }
 
 
 def call_tool(name: str, args: dict[str, Any]) -> Any:
-    def build_node_packet() -> dict[str, Any]:
-        from .market_packet import MarketPacketBuilder
-        return MarketPacketBuilder().build(
-            args["node"],
-            include_intraday=bool(args.get("include_intraday", True)),
-            persist=bool(args.get("persist", True)),
-        )
-
     handlers: dict[str, Callable[[], Any]] = {
         "account_get": state.get_account,
         "context_get": lambda: state.context_pack(args.get("day")),
         "analysis_protocol_get": analysis_protocol_pack,
-        "node_packet_get": build_node_packet,
-        "dispatch_node_claim": lambda: state.claim_dispatch_node(args["day"], args["node"]),
-        "task_session_get": lambda: state.get_task_session(args["day"]),
-        "task_session_register": lambda: state.register_task_session(args["day"], args["thread_id"], args.get("host_id", "local"), args.get("title", ""), args.get("source", "scheduled_node"), bool(args.get("replace", False))),
-        "order_intent_create": lambda: state.create_order_intent(args["code"], args["name"], args["side"], float(args["limit_price"]), int(args["shares"]), args["valid_from"], args["valid_until"], args["reason"], args.get("run_id")),
+        "analysis_packet_get": lambda: MarketPacketBuilder().build(args.get("trigger", "manual"), include_intraday=bool(args.get("include_intraday", True)), persist=bool(args.get("persist", True))),
+        "daily_session_get": lambda: runtime.get_session(args["day"]),
+        "daily_session_register": lambda: runtime.register_session(args["day"], args["thread_id"], args.get("host_id", "local"), args.get("title", ""), args.get("source", "daily_bootstrap"), bool(args.get("replace", False))),
+        "daily_session_heartbeat_register": lambda: runtime.register_heartbeat(args["day"], args["automation_id"]),
+        "analysis_runtime_poll": lambda: runtime.poll(args["day"], args.get("source", "heartbeat"), bool(args.get("force", False)), MarketPacketBuilder().monitor_snapshot),
+        "analysis_cycle_complete": lambda: runtime.complete_cycle(args["day"], args["run_id"], args["status"], args["summary"], bool(args.get("close_session", False))),
+        "monitor_templates_get": monitoring.load_templates,
+        "monitor_plan_get": lambda: monitoring.get_plan(args["day"]),
+        "monitor_plan_apply": lambda: monitoring.apply_plan(args["day"], args["monitors"], args["rationale"]),
+        "sector_universe_get": state.get_sector_universe,
+        "sector_universe_update": lambda: state.update_sector_universe(args["sectors"], args["sources"], args["as_of"], args["valid_until"], args["rationale"]),
+        "order_intent_create": lambda: state.create_order_intent(args["code"], args["name"], args["side"], float(args["limit_price"]), int(args["shares"]), args["valid_from"], args["valid_until"], args["reason"], args["feedback_deadline"], args.get("run_id")),
         "trade_feedback_record": lambda: state.record_trade_feedback(args["order_id"], args["status"], int(args.get("filled_shares", 0)), args.get("fill_price"), float(args.get("fees", 0))),
         "account_reconcile": lambda: state.reconcile_account(args["as_of"], float(args["available_cash"]), args["positions"], args["note"]),
         "trading_day_rollover": lambda: state.rollover(args["as_of"]),
@@ -87,12 +96,7 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
         "candidate_pool_update": lambda: state.update_watchlist(args["candidates"], args["rationale"], args.get("as_of"), args.get("metadata")),
         "candidate_pool_health_record": lambda: state.record_watchlist_health(args["status"], args["reasons"], args["metrics"], args["action"], args.get("as_of")),
         "analysis_run_record": lambda: str(state.record_run(args["day"], args["run_id"], args["payload"])),
-        "node_delivery_prepare": lambda: state.prepare_node_delivery(args["day"], args["node"], args["target_thread_id"], args.get("target_host_id", "local"), args.get("source_thread_id", "")),
-        "node_delivery_confirm": lambda: state.confirm_node_delivery(args["day"], args["node"], args["delivery_id"], args["transport_id"]),
-        "node_delivery_fail": lambda: state.fail_node_delivery(args["day"], args["node"], args["delivery_id"], args["reason"]),
-        "node_analysis_complete": lambda: state.complete_node_analysis(args["day"], args["node"], args["delivery_id"], args["run_id"], args.get("status", "completed"), args.get("summary", "")),
-        "node_execution_status_get": lambda: state.get_node_execution_status(args["day"], args["node"]),
-        "reports_close_day": lambda: {"daily": reports.close_day(args["day"], args.get("note", "")), "weekly": reports.weekly_report(args["day"]), "monthly": reports.monthly_report(args["day"])},
+        "reports_close_day": lambda: {"daily": reports.close_day(args["day"], args["run_id"], args["review"], args.get("note", "")), "weekly": reports.weekly_report(args["day"]), "monthly": reports.monthly_report(args["day"])},
         "strategy_logic_get": trading_logic.load_logic,
         "strategy_entry_check": lambda: trading_logic.entry_check(args["snapshot"]),
         "strategy_exit_check": lambda: trading_logic.exit_check(args["position"], float(args["current_price"]), args.get("highest_close")),
@@ -126,7 +130,7 @@ def serve() -> None:
             request_id = request.get("id")
             method = request.get("method")
             if method == "initialize":
-                response(request_id, {"protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "a-share-trading-desk", "version": "0.2.1"}})
+                response(request_id, {"protocolVersion": request.get("params", {}).get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}}, "serverInfo": {"name": "a-share-trading-desk", "version": "0.5.0"}})
             elif method == "tools/list":
                 response(request_id, {"tools": TOOLS})
             elif method == "tools/call":

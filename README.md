@@ -1,51 +1,51 @@
-# A-Share Trading Agent Harness
+# A-Share Dynamic Trading Agent Harness
 
-一个面向沪深主板分析场景的领域型 Agent Harness：用 Prompt 协议和 MCP 工具编排 Agent，用确定性程序承接状态、风险、调度与审计，仅生成供人工确认的交易辅助建议。
+一个面向沪深主板、仅分析不自动下单的本地 Agent Harness。Agent 负责解释市场并提出供人工确认的建议；确定性程序负责账户、T+1、资金与股份锁定、腾讯行情新鲜度、动态计时器、监控防抖和审计归档。
 
-> 本项目不连接券商，不自动下单，不承诺收益，也不构成投资建议。公开仓库不包含任何真实账户、持仓、现金、候选池、交易记录或任务标识。
+> 本项目不连接券商，不承诺收益，也不构成投资建议。公开仓库不包含真实账户、持仓、现金、候选池、交易记录、Codex 任务 ID 或自动化 ID。
 
-## 为什么是 Agent Harness
+## v5.1 工作流
 
-- **Orchestration**：独立节点自动化、原子时间门禁和每日唯一分析任务组成可恢复的多节点运行框架，不复用跨日调度窗口。
-- **Tool contract**：MCP stdio server 为账户、候选池、策略检查、订单意图、成交反馈和归档提供结构化接口。
-- **Deterministic state**：资金、股份、T+1、未反馈委托锁定和策略版本由程序维护，不从对话历史推断。
-- **Guardrails**：Agent 的建议必须经过风险规则和状态校验；关键证据不足时拒绝生成新买入或伪精确指令。
-- **Resilience**：节点之间相互独立，重复、过期和未来节点静默跳过；外部数据适配器可替换，单源失败不阻断归档。
-- **Observability**：每次运行保存证据、数据健康、策略检查和用户可见结论，并形成日报、周报与月报。
-- **Human-in-the-loop**：Agent 只创建订单意图，账户仅在用户反馈实际结果后更新。
-
-## 核心边界
-
-- **Agent 层**：只补充少量公告和权威消息，解释程序数据包并生成建议。
-- **行情程序**：批量报价、并发分时/日K、按日缓存和本地技术指标；腾讯合规时不调用备用报价。
-- **确定性核心**：维护账户、T+1、未反馈委托锁定、候选池、风险纪律、节点认领和审计归档。
-- **外部适配器**：行情与新闻工具不与核心耦合；单源失败不能阻断其他类别和归档。
-- **人工执行**：建议必须给出明确限价、股数、时段与失效条件，但不会提交到券商。
+- 每个北京时间交易日只保留一个 `A股交易台 YYYY-MM-DD` 任务。
+- 首次进入项目后立即分析；后续完整分析由上次完成 60 分钟、用户请求、监控信号或收盘触发。
+- 5 分钟 heartbeat 只轮询触发条件，不等于每 5 分钟执行完整分析。任何手动分析完成后都会重置 60 分钟计时。
+- 不再暴露或使用八个固定时间节点。
+- 收盘必须先生成新的 `market_close` 数据包并执行完整分析，再复核全天记录，最后生成下一交易日的基准/偏强/偏弱预期和条件行动计划。三部分缺一不可。
 
 ```mermaid
 flowchart LR
-    S[Scheduler] --> A[Analysis Agent]
-    S --> D[Deterministic market packet]
-    D --> A
-    A --> M[MCP deterministic core]
-    M --> P[Private local state]
-    M --> R[Risk and T+1 checks]
-    M --> J[Audit journals]
-    A --> U[Human-reviewed instruction]
-    U -. manual execution .-> B[Broker]
+    O["SessionStart / daily bootstrap"] --> S["Unique daily task"]
+    S --> P["Runtime poll"]
+    H["5-minute heartbeat"] --> P
+    U["User request"] --> P
+    M["Monitor signal"] --> P
+    P -->|due| D["Tencent-only data packet"]
+    D --> A["Human-trader analysis"]
+    A --> R["Run record + reset 60-minute timer"]
+    R --> P
+    A -->|post-close| C["Close analysis + day review + next-day outlook"]
+    C --> X["Archive and pause timer"]
 ```
 
-## Harness 能力
+## 数据可信边界
 
-- 每个交易日复用唯一分析任务，多个时间节点独立触发。
-- 无跨日持久调度器；恢复运行时按实际北京时间认领最近到期节点。
-- 内置持仓/候选行情、分时、日K、指数代理和本地技术/相对强弱特征。
-- 原子节点认领：错过早盘节点不影响后续节点，历史节点不会补发过期指令。
-- 每周候选池漏斗：板块硬筛、每板块最多10只、固定评分、最多5只候选。
-- 固定止损、分级止盈、移动止盈、仓位风险预算和双向做T检查。
-- 精确订单意图与成交反馈状态机，未反馈时锁定资金或可卖股份。
-- 日报、周报、月报和策略演进门禁。
-- 无外部运行依赖的 MCP stdio server。
+- 盘中个股、指数、分时、日 K 和板块成分股报价只使用腾讯。
+- 腾讯缺失、超时、字段异常或时间戳过期时标记 `tradeable=false`；缓存只能作为背景，不得生成精确交易建议。
+- 不自动切换东方财富、同花顺或 DangInvest。它们只可在周筛或人工诊断中作为候选来源。
+- 板块不依赖第三方盘中板块接口。周筛来源必须同日、完整度至少 95%、连续成功至少 2 次，才保存成分股快照；盘中以快照代码和腾讯批量行情本地计算板块代理。
+
+StockPet 仅作为腾讯批量请求、退避、陈旧标记和阈值防抖的工程参考，本项目没有继承其数据源回退策略。
+
+## 输出和安全
+
+每轮按“事实 → 解读 → 规则 → 结论”展示逻辑。真实可执行建议先通过 `order_intent_create` 锁定资源，并严格输出：
+
+```text
+时间，股票，买/卖精确价格，买卖数量，反馈等待时间
+10:35-10:40，600000 示例股票，买 10.230 元，100 股，等待反馈至 10:45
+```
+
+次日计划是条件预案，不是隔夜委托。信号出现后必须重新分析，才能登记真实订单意图。
 
 ## 快速开始
 
@@ -60,36 +60,22 @@ a-share-desk account
 pytest -q
 ```
 
-Linux/macOS 使用 `export A_SHARE_DESK_HOME="$PWD/.runtime"`。`A_SHARE_DESK_HOME` 下生成的 `state/`、`records/` 和 `journal/` 都是私有运行数据。
+Linux/macOS 使用 `export A_SHARE_DESK_HOME="$PWD/.runtime"`。运行时生成的 `state/`、`records/`、`journal/` 和策略复盘会保存在私有目录中。
 
-## MCP
-
-启动 stdio server：
+MCP 服务：
 
 ```bash
 python -m trading_desk.mcp_server
 ```
 
-客户端配置参考 [examples/mcp-config.example.json](examples/mcp-config.example.json)。工具包括账户读取、跨日滚动、节点认领、候选池维护、策略检查、订单意图、成交反馈和归档。
+客户端示例见 [examples/mcp-config.example.json](examples/mcp-config.example.json)。动态协议位于 `prompts/`，运行配置位于 `config/runtime.json`，监控模板位于 `monitoring/templates.json`。
 
-## Prompt 工作流
+## 关键组件
 
-- [全局协议](prompts/global_policy.md)
-- [Agent 数据采集协议](prompts/data_acquisition.md)
-- [日内节点](prompts/daily_nodes.md)
-- [调度与每日唯一任务](prompts/daily_dispatcher.md)
-- [每周候选池筛选](prompts/weekly_candidate_screen.md)
+- `trading_desk/runtime.py`：唯一日任务、租约、60 分钟计时、监控/收盘触发、关闭与复盘修订。
+- `trading_desk/market_packet.py`：腾讯批量报价、分时、日 K、本地指标、大盘和板块代理。
+- `trading_desk/monitoring.py`：监控计划、crossing、cooldown、rearm 和信号留档。
+- `trading_desk/reports.py`：三段式收盘校验、次日条件预案、日报/周报/月报与交接包。
+- `trading_desk/state.py`：账户、T+1、候选池、板块快照、订单意图和运行审计。
 
-仓库内置公开行情适配器，不需要把结构化行情交给 LLM。使用时仍应遵守数据采集协议：腾讯主源成功即停止、失败时限时降级、单一合规来源即可进入精确指令流程。
-
-## 文档
-
-- [Agent Harness 定位](docs/AGENT_HARNESS.md)
-- [架构说明](docs/ARCHITECTURE.md)
-- [自动任务设计](docs/AUTOMATIONS.md)
-- [人类交易员数据矩阵](docs/TRADER_DATA_MATRIX.md)
-- [隐私与安全](SECURITY.md)
-
-## 隐私
-
-真实运行目录已被 `.gitignore` 排除。不要把券商截图、账户JSON、任务ID、自动化ID、Cookie、Token或交易日志提交到公开仓库。示例文件全部为空状态或占位符。
+更多说明见 [架构](docs/ARCHITECTURE.md)、[自动任务](docs/AUTOMATIONS.md)、[数据矩阵](docs/TRADER_DATA_MATRIX.md) 和 [安全策略](SECURITY.md)。

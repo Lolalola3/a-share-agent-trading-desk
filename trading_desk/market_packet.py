@@ -28,7 +28,7 @@ from . import state
 # China Standard Time has no daylight saving transition.  Using a fixed offset
 # avoids requiring the optional ``tzdata`` wheel on Windows installations.
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
-USER_AGENT = "StockPet-inspired A-share Trading Desk/0.2"
+USER_AGENT = "StockPet-inspired A-share Trading Desk/0.5.1"
 LATEST_TIMEOUT_SECONDS = 2.5
 SECONDARY_TIMEOUT_SECONDS = 4.5
 INTRADAY_TIMEOUT_SECONDS = 4.5
@@ -43,6 +43,13 @@ MARKET_BENCHMARKS = {
 NODE_NAMES = {
     "09:08": "盘前准备", "09:22": "开盘计划", "10:30": "上午复核", "11:25": "午间复盘",
     "13:00": "午后开盘", "14:25": "尾盘确认", "14:50": "收盘风险", "15:05": "收盘复盘",
+}
+ANALYSIS_TRIGGERS = {
+    "startup": "当日首次打开",
+    "timer": "一小时计时到期",
+    "manual": "用户主动要求",
+    "monitor": "监控信号触发",
+    "market_close": "收盘复盘",
 }
 
 
@@ -557,15 +564,13 @@ class MarketPacketBuilder:
                 return {"ok": True, **result}
             raise MarketDataError("腾讯分时没有足够绘图点")
         except Exception as primary_error:
-            query = urlencode({"secid": eastmoney_secid(code), "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13", "fields2": "f51,f52,f53,f54,f55,f56,f57,f58", "iscr": "0", "ndays": "1"})
-            try:
-                raw = self.fetcher(f"https://push2delay.eastmoney.com/api/qt/stock/trends2/get?{query}", INTRADAY_TIMEOUT_SECONDS)
-                result = parse_eastmoney_intraday(json.loads(raw.decode("utf-8")), quote)
-                if result:
-                    return {"ok": True, "fallback_from": "腾讯分时", **result}
-                raise MarketDataError("东方财富分时没有足够绘图点")
-            except Exception as fallback_error:
-                return {"ok": False, "source": "腾讯分时/东方财富分时备用", "error": f"{type(primary_error).__name__}; {type(fallback_error).__name__}"}
+            return {
+                "ok": False,
+                "source": "腾讯分时",
+                "tradeable": False,
+                "error": type(primary_error).__name__,
+                "policy": "腾讯失败即标记不可用；盘中禁止自动切换非腾讯数据源。",
+            }
 
     def _load_cache(self) -> dict[str, Any]:
         try:
@@ -635,7 +640,7 @@ class MarketPacketBuilder:
         return result
 
 
-    def build(self, node: str, include_intraday: bool = True, persist: bool = True) -> dict[str, Any]:
+    def _legacy_build_v2(self, node: str, include_intraday: bool = True, persist: bool = True) -> dict[str, Any]:
         """Build the version-2 decision packet without mutating trading state.
 
         Quotes are fetched in one Tencent batch.  Intraday paths and missing
@@ -989,6 +994,349 @@ class MarketPacketBuilder:
             path = state.RECORDS_DIR / "market_packets" / now.strftime("%Y-%m-%d") / f"{now:%H%M%S}_{node.replace(':', '')}.json"
             packet["packet_path"] = str(path)
             packet["timing"] = {"total_elapsed_ms": round((time.perf_counter() - started) * 1000)}
+            state._write_json(path, packet)
+        else:
+            packet["packet_path"] = None
+            packet["ephemeral"] = True
+        packet["timing"] = {"total_elapsed_ms": round((time.perf_counter() - started) * 1000)}
+        return packet
+
+    def _fetch_tencent_latest_batched(self, codes: list[str]) -> dict[str, dict[str, Any]]:
+        """Fetch Tencent quotes in bounded batches, preserving raw six-digit keys."""
+        config_path = state.PACKAGE_ROOT / "config" / "runtime.json"
+        try:
+            batch_size = max(1, int(json.loads(config_path.read_text(encoding="utf-8")).get("tencent_batch_size", 50)))
+        except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+            batch_size = 50
+        unique_codes = list(dict.fromkeys(str(code) for code in codes))
+        result: dict[str, dict[str, Any]] = {}
+        for start in range(0, len(unique_codes), batch_size):
+            result.update(self._fetch_tencent_latest(unique_codes[start:start + batch_size]))
+        return result
+
+    @staticmethod
+    def _median(values: list[float]) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2
+
+    def _sector_context(
+        self,
+        universe: dict[str, Any],
+        tracked_codes: set[str],
+        tracked_sector_names: set[str],
+        quotes: dict[str, dict[str, Any]],
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Compute sector proxies only from audited membership + Tencent quotes."""
+        config_path = state.PACKAGE_ROOT / "config" / "runtime.json"
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            cfg = {}
+        coverage_min = float(cfg.get("sector_quote_coverage_min", 0.8))
+        max_age_days = int(cfg.get("sector_universe_max_age_days", 8))
+        if universe.get("status") != "active" or not universe.get("sectors"):
+            return {
+                "status": "unavailable",
+                "reason": "没有已审计的板块成分快照。",
+                "trade_rule": "板块硬条件不可用，不得据此生成买入建议。",
+                "sectors": [],
+            }
+        try:
+            as_of = datetime.fromisoformat(str(universe["as_of"])).date()
+            valid_until = datetime.fromisoformat(str(universe["valid_until"])).date()
+            age_days = (now.date() - as_of).days
+        except (KeyError, TypeError, ValueError):
+            return {"status": "unavailable", "reason": "板块快照日期无效。", "sectors": []}
+        if age_days < 0 or age_days > max_age_days or now.date() > valid_until:
+            return {
+                "status": "stale",
+                "reason": f"板块快照已过期或超过 {max_age_days} 天。",
+                "as_of": universe.get("as_of"),
+                "valid_until": universe.get("valid_until"),
+                "sectors": [],
+            }
+        relevant = []
+        for sector in universe.get("sectors", []):
+            member_codes = {str(member.get("code")) for member in sector.get("constituents", [])}
+            if sector.get("name") in tracked_sector_names or member_codes.intersection(tracked_codes):
+                relevant.append(sector)
+        sector_rows = []
+        for sector in relevant:
+            members = list(sector.get("constituents", []))
+            usable = []
+            for member in members:
+                code = str(member.get("code"))
+                quote = quotes.get(code) or {}
+                if quote.get("tradeable") and quote.get("change_pct") is not None:
+                    usable.append({"code": code, "name": member.get("name", ""), "quote": quote})
+            coverage = len(usable) / len(members) if members else 0.0
+            changes = [float(item["quote"]["change_pct"]) for item in usable]
+            passed = coverage >= coverage_min
+            ranked = sorted(usable, key=lambda item: item["quote"]["change_pct"], reverse=True)
+            tracked_ranks = [
+                {
+                    "code": item["code"],
+                    "rank": index,
+                    "of": len(ranked),
+                    "change_pct": item["quote"]["change_pct"],
+                }
+                for index, item in enumerate(ranked, start=1)
+                if item["code"] in tracked_codes
+            ]
+            amount_values = [
+                float(item["quote"]["amount_cny"])
+                for item in usable
+                if item["quote"].get("amount_cny") is not None
+            ]
+            sector_rows.append({
+                "name": sector.get("name"),
+                "status": "ready" if passed else "insufficient_coverage",
+                "constituents": len(members),
+                "fresh_tencent_quotes": len(usable),
+                "quote_coverage": round(coverage, 4),
+                "coverage_required": coverage_min,
+                "equal_weight_mean_change_pct": _round(sum(changes) / len(changes)) if passed and changes else None,
+                "median_change_pct": _round(self._median(changes)) if passed and changes else None,
+                "advance_ratio": _round(sum(value > 0 for value in changes) / len(changes), 4) if passed and changes else None,
+                "amount_coverage": round(len(amount_values) / len(members), 4) if members else 0.0,
+                "observed_amount_cny": _round(sum(amount_values), 2) if amount_values else None,
+                "tracked_stock_ranks": tracked_ranks,
+            })
+        ready = sum(item["status"] == "ready" for item in sector_rows)
+        return {
+            "status": "ready" if sector_rows and ready == len(sector_rows) else "degraded" if ready else "unavailable",
+            "method": "审计成分股快照 + 腾讯批量实时行情的等权代理",
+            "membership_as_of": universe.get("as_of"),
+            "membership_valid_until": universe.get("valid_until"),
+            "sources": universe.get("sources", []),
+            "sectors": sector_rows,
+            "warning": "这不是第三方板块实时接口；覆盖率不足时板块硬条件不可用。",
+        }
+
+    def monitor_snapshot(self, codes: list[str]) -> dict[str, dict[str, Any]]:
+        """Return a small Tencent-only snapshot for monitor polling."""
+        now = shanghai_now()
+        raw_codes = list(dict.fromkeys(str(code) for code in codes))
+        benchmark = "sh000300"
+        try:
+            fetched = self._fetch_tencent_latest_batched(raw_codes + [benchmark])
+        except Exception:
+            fetched = {}
+        csi = self._combined_quote("000300", fetched.get("000300"), None, None, now)
+        result: dict[str, dict[str, Any]] = {}
+        for code in raw_codes:
+            quote = self._combined_quote(code, fetched.get(code), None, None, now)
+            relative = None
+            if quote.get("tradeable") and csi.get("tradeable"):
+                relative = _round(float(quote["change_pct"]) - float(csi["change_pct"]))
+            result[code] = {
+                "quote": quote,
+                "relative_strength": {"vs_csi300_intraday_pct_points": relative},
+            }
+        return result
+
+    def build(self, trigger: str = "manual", include_intraday: bool = True, persist: bool = True) -> dict[str, Any]:
+        """Build a dynamic Tencent-only decision packet (workflow v5)."""
+        started = time.perf_counter()
+        now = shanghai_now()
+        today = now.date().isoformat()
+        trigger = str(trigger or "manual")
+        account, watchlist = state.get_account(), state.get_watchlist()
+        universe = state.get_sector_universe()
+        positions = list(account.get("positions", []))
+        candidates = list(watchlist.get("candidates", []))
+        position_by_code = {str(item["code"]): item for item in positions}
+        candidate_by_code = {str(item["code"]): item for item in candidates}
+        identities: dict[str, dict[str, Any]] = {}
+        for position in positions:
+            identities[str(position["code"])] = {
+                "role": "holding", "name": position.get("name", ""), "sector": position.get("sector", ""),
+            }
+        for candidate in candidates:
+            identities.setdefault(str(candidate["code"]), {
+                "role": "candidate", "name": candidate.get("name", ""), "sector": candidate.get("sector", ""),
+            })
+        tracked_codes = list(identities)
+        tracked_sectors = {str(item.get("sector")) for item in identities.values() if item.get("sector")}
+        relevant_sector_members: list[str] = []
+        tracked_set = set(tracked_codes)
+        for sector in universe.get("sectors", []):
+            members = [str(item.get("code")) for item in sector.get("constituents", [])]
+            if sector.get("name") in tracked_sectors or tracked_set.intersection(members):
+                relevant_sector_members.extend(members)
+        benchmark_codes = list(MARKET_BENCHMARKS)
+        all_quote_codes = list(dict.fromkeys(tracked_codes + relevant_sector_members + benchmark_codes))
+        cache = self._load_cache()
+        source_health: list[dict[str, Any]] = []
+        quote_started = time.perf_counter()
+        try:
+            fetched = self._fetch_tencent_latest_batched(all_quote_codes)
+            source_health.append({
+                "name": "腾讯批量实时行情", "status": "online", "symbols": len(fetched),
+                "requested_symbols": len(all_quote_codes),
+                "elapsed_ms": round((time.perf_counter() - quote_started) * 1000),
+            })
+        except Exception as exc:
+            fetched = {}
+            source_health.append({
+                "name": "腾讯批量实时行情", "status": "offline", "symbols": 0,
+                "requested_symbols": len(all_quote_codes), "error": f"{type(exc).__name__}: {str(exc)[:120]}",
+                "elapsed_ms": round((time.perf_counter() - quote_started) * 1000),
+            })
+        source_health.append({
+            "name": "非腾讯盘中实时源", "status": "disabled", "symbols": 0,
+            "policy": "不会调用东方财富、同花顺或 DangInvest 作为自动回退。",
+        })
+        cached_quotes = cache.get("quotes") or {}
+        quotes = {
+            code: self._combined_quote(code, fetched.get(code), None, cached_quotes.get(code), now)
+            for code in list(dict.fromkeys(tracked_codes + relevant_sector_members))
+        }
+        benchmark_quotes = {
+            full[2:]: self._combined_quote(full[2:], fetched.get(full[2:]), None, (cache.get("market") or {}).get(full[2:]), now)
+            for full in benchmark_codes
+        }
+
+        kline_cache = dict(cache.get("klines") or {})
+        history_bars: dict[str, list[dict[str, Any]]] = {}
+        history_codes = tracked_codes + benchmark_codes
+        missing = []
+        for requested in history_codes:
+            raw = requested[2:] if requested.startswith(("sh", "sz")) else requested
+            entry = kline_cache.get(raw) or {}
+            if entry.get("fetched_on") == today and isinstance(entry.get("bars"), list):
+                history_bars[raw] = entry["bars"]
+            else:
+                missing.append(requested)
+        errors = []
+        if missing:
+            with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_REQUESTS, len(missing))) as executor:
+                futures = {executor.submit(self._fetch_tencent_kline, code): code for code in missing}
+                for future in as_completed(futures):
+                    requested = futures[future]
+                    raw = requested[2:] if requested.startswith(("sh", "sz")) else requested
+                    try:
+                        bars = future.result()
+                        if bars:
+                            history_bars[raw] = bars
+                            kline_cache[raw] = {"fetched_on": today, "bars": bars}
+                        elif isinstance((kline_cache.get(raw) or {}).get("bars"), list):
+                            history_bars[raw] = kline_cache[raw]["bars"]
+                    except Exception as exc:
+                        errors.append(f"{raw}:{type(exc).__name__}")
+                        if isinstance((kline_cache.get(raw) or {}).get("bars"), list):
+                            history_bars[raw] = kline_cache[raw]["bars"]
+        source_health.append({
+            "name": "腾讯前复权日K", "status": "online" if history_bars else "offline",
+            "symbols": len(history_bars), "errors": errors[:8],
+        })
+
+        intraday: dict[str, Any] = {}
+        if include_intraday and tracked_codes:
+            with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_REQUESTS, len(tracked_codes))) as executor:
+                futures = {executor.submit(self._fetch_intraday, code, quotes.get(code)): code for code in tracked_codes}
+                for future in as_completed(futures):
+                    code = futures[future]
+                    try:
+                        intraday[code] = future.result()
+                    except Exception as exc:
+                        intraday[code] = {"ok": False, "source": "腾讯分时", "error": type(exc).__name__}
+        source_health.append({
+            "name": "腾讯分时", "status": "online" if any(item.get("ok") for item in intraday.values()) else "not_requested" if not include_intraday else "offline",
+            "symbols": sum(bool(item.get("ok")) for item in intraday.values()),
+        })
+
+        benchmark_rows = []
+        for full_code, name in MARKET_BENCHMARKS.items():
+            raw = full_code[2:]
+            quote = benchmark_quotes[raw]
+            technical = _technical_features(history_bars.get(raw, []), quote, now)
+            benchmark_rows.append({"code": raw, "name": name, "quote": quote, "technical": technical})
+        live_changes = [float(item["quote"]["change_pct"]) for item in benchmark_rows if item["quote"].get("tradeable")]
+        positive = sum(value > 0 for value in live_changes)
+        if len(live_changes) < 2:
+            regime = "数据不足"
+        elif positive == len(live_changes):
+            regime = "指数普涨"
+        elif positive >= 2:
+            regime = "指数偏强但有分化"
+        elif positive == 1:
+            regime = "指数偏弱且有分化"
+        else:
+            regime = "指数普跌"
+        market_context = {
+            "regime": regime,
+            "positive_benchmarks": positive,
+            "average_change_pct": _round(sum(live_changes) / len(live_changes)) if live_changes else None,
+            "benchmarks": benchmark_rows,
+            "scope_note": "仅以腾讯指数行情判断大盘环境，不臆造全市场宽度。",
+        }
+        csi = next((item for item in benchmark_rows if item["code"] == "000300"), {})
+        csi_change = (csi.get("quote") or {}).get("change_pct")
+        csi_5d = (csi.get("technical") or {}).get("return_5d_pct")
+        rows = []
+        for code, identity in identities.items():
+            quote = quotes[code]
+            technical = _technical_features(history_bars.get(code, []), quote, now, position_by_code.get(code, {}).get("opened_on"))
+            relative = {
+                "vs_csi300_intraday_pct_points": _round(float(quote["change_pct"]) - float(csi_change)) if quote.get("change_pct") is not None and csi_change is not None else None,
+                "vs_csi300_5d_pct_points": _round(float(technical["return_5d_pct"]) - float(csi_5d)) if technical.get("return_5d_pct") is not None and csi_5d is not None else None,
+            }
+            row = {"code": code, **identity, "quote": quote, "intraday": intraday.get(code), "technical": technical, "relative_strength": relative}
+            if identity["role"] == "holding":
+                position = position_by_code[code]
+                cost, shares = _number(position.get("cost")), int(position.get("shares", 0))
+                row["position"] = {
+                    **{key: position.get(key) for key in ("shares", "sellable_shares", "today_bought_shares", "cost", "opened_on", "sector")},
+                    "market_value": _round(float(quote["last_price"]) * shares, 2) if quote.get("last_price") else None,
+                    "unrealized_pnl_cny": _round((float(quote["last_price"]) - float(cost)) * shares, 2) if quote.get("last_price") and cost else None,
+                    "unrealized_pnl_pct": _pct_change(quote.get("last_price"), cost),
+                }
+            else:
+                candidate = candidate_by_code[code]
+                row["candidate"] = dict(candidate)
+            rows.append(row)
+        sector_context = self._sector_context(universe, set(tracked_codes), tracked_sectors, quotes, now)
+        for row in rows:
+            row["sector_proxy"] = next((item for item in sector_context.get("sectors", []) if item.get("name") == row.get("sector")), None)
+        tradeable_count = sum(bool(item["quote"].get("tradeable")) for item in rows)
+        packet = {
+            "schema_version": 3,
+            "kind": "dynamic_market_packet",
+            "trigger": trigger,
+            "trigger_name": ANALYSIS_TRIGGERS.get(trigger, "自定义触发"),
+            "generated_at": now.isoformat(timespec="seconds"),
+            "freshness_requirement_seconds": FRESHNESS_SECONDS,
+            "scope": {"holdings": len(positions), "candidates": len(candidates), "tracked_symbols": len(rows), "sector_proxy_symbols": len(set(relevant_sector_members))},
+            "source_policy": {
+                "intraday_primary": "腾讯",
+                "automatic_fallback": False,
+                "on_tencent_failure": "标记不可交易并等待下次刷新",
+            },
+            "source_health": source_health,
+            "market_context": market_context,
+            "sector_context": sector_context,
+            "account": {"as_of": account.get("as_of"), "cash_available": account.get("cash_available"), "cash_frozen": account.get("cash_frozen"), "pending_orders": account.get("pending_orders", [])},
+            "watchlist": {"status": watchlist.get("status"), "health": watchlist.get("health"), "valid_until": watchlist.get("valid_until"), "metadata": watchlist.get("metadata")},
+            "instruments": rows,
+            "summary": {
+                "tradeable_quotes": tradeable_count,
+                "unavailable_or_stale_quotes": len(rows) - tradeable_count,
+                "instruction": "只有腾讯 fresh 且 tradeable=true 的个股可生成精确交易建议；板块覆盖不足时板块硬条件不可用。",
+            },
+            "timing": {"total_elapsed_ms": round((time.perf_counter() - started) * 1000)},
+        }
+        if persist:
+            self._save_cache(quotes, intraday, kline_cache, benchmark_quotes)
+            safe_trigger = re.sub(r"[^A-Za-z0-9_-]+", "_", trigger)[:40] or "manual"
+            path = state.RECORDS_DIR / "market_packets" / today / f"{now:%H%M%S}_{safe_trigger}.json"
+            packet["packet_path"] = str(path)
             state._write_json(path, packet)
         else:
             packet["packet_path"] = None

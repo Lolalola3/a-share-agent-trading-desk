@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "max_active_monitors": 20,
+  "templates": [
+    {
+      "id": "price_breakout",
+      "name": "价格向上突破",
+      "metric": "quote.last_price",
+      "operator": "gte",
+      "default_rearm_delta": 0.05,
+      "description": "最新价达到或超过指定压力价后触发；回落到阈值下方指定距离后重新武装。"
+    },
+    {
+      "id": "price_breakdown",
+      "name": "价格向下跌破",
+      "metric": "quote.last_price",
+      "operator": "lte",
+      "default_rearm_delta": 0.05,
+      "description": "最新价达到或跌破指定支撑、失效或止损价后触发；反弹到阈值上方指定距离后重新武装。"
+    },
+    {
+      "id": "change_strength",
+      "name": "当日涨幅增强",
+      "metric": "quote.change_pct",
+      "operator": "gte",
+      "default_rearm_delta": 0.3,
+      "description": "当日涨幅达到指定百分比后触发。阈值和重置距离均为百分点。"
+    },
+    {
+      "id": "change_weakness",
+      "name": "当日跌幅扩大",
+      "metric": "quote.change_pct",
+      "operator": "lte",
+      "default_rearm_delta": 0.3,
+      "description": "当日涨跌幅低于指定负百分比后触发。阈值和重置距离均为百分点。"
+    },
+    {
+      "id": "vwap_reclaim",
+      "name": "重新站上 VWAP",
+      "metric": "quote.price_vs_vwap_pct",
+      "operator": "gte",
+      "default_rearm_delta": 0.2,
+      "description": "最新价相对成交均价的偏离达到指定百分点后触发。"
+    },
+    {
+      "id": "vwap_loss",
+      "name": "跌破 VWAP",
+      "metric": "quote.price_vs_vwap_pct",
+      "operator": "lte",
+      "default_rearm_delta": 0.2,
+      "description": "最新价相对成交均价的偏离低于指定负百分点后触发。"
+    },
+    {
+      "id": "relative_strength",
+      "name": "相对沪深300走强",
+      "metric": "relative_strength.vs_csi300_intraday_pct_points",
+      "operator": "gte",
+      "default_rearm_delta": 0.3,
+      "description": "个股相对沪深300的日内超额达到指定百分点后触发。"
+    },
+    {
+      "id": "relative_weakness",
+      "name": "相对沪深300走弱",
+      "metric": "relative_strength.vs_csi300_intraday_pct_points",
+      "operator": "lte",
+      "default_rearm_delta": 0.3,
+      "description": "个股相对沪深300的日内超额低于指定负百分点后触发。"
+    }
+  ]
+}

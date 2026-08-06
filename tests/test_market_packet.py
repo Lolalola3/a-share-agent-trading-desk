@@ -10,20 +10,28 @@ from trading_desk import market_packet, mcp_server, state
 class MarketPacketTests(unittest.TestCase):
     def test_protocol_pack_avoids_unattended_shell_reads(self):
         result = mcp_server.call_tool("analysis_protocol_get", {})
-        self.assertEqual(result["prompt_workflow_version"], "4.0.0")
-        self.assertIn("daily_dispatcher.md", result["prompts"])
-        self.assertIn("禁止任何 Shell", result["prompts"]["daily_dispatcher.md"])
+        self.assertEqual(result["prompt_workflow_version"], "5.1.0")
+        self.assertIn("daily_session.md", result["prompts"])
+        self.assertIn("腾讯", result["prompts"]["data_acquisition.md"])
+        self.assertNotIn("daily_dispatcher.md", result["prompts"])
         self.assertIn("version", result["strategy"])
 
-    def test_mcp_node_packet_tool_avoids_shell_entrypoint(self):
-        expected = {"node": "10:30", "status": "ready"}
+    def test_mcp_dynamic_packet_tool_avoids_shell_entrypoint(self):
+        expected = {"trigger": "manual", "status": "ready"}
         with patch.object(market_packet.MarketPacketBuilder, "build", return_value=expected) as build:
             result = mcp_server.call_tool(
-                "node_packet_get",
-                {"node": "10:30", "include_intraday": True, "persist": True},
+                "analysis_packet_get",
+                {"trigger": "manual", "include_intraday": True, "persist": True},
             )
         self.assertEqual(result, expected)
-        build.assert_called_once_with("10:30", include_intraday=True, persist=True)
+        build.assert_called_once_with("manual", include_intraday=True, persist=True)
+
+    def test_fixed_node_tools_are_not_exposed(self):
+        names = {tool["name"] for tool in mcp_server.TOOLS}
+        self.assertIn("analysis_runtime_poll", names)
+        self.assertIn("monitor_plan_apply", names)
+        self.assertNotIn("dispatch_node_claim", names)
+        self.assertNotIn("node_packet_get", names)
 
     def test_tencent_parser_normalizes_and_calculates_fields(self):
         fields = [""] * 40
@@ -73,7 +81,7 @@ class MarketPacketTests(unittest.TestCase):
                 builder = PrimaryFirstBuilder(cache_path=state.STATE_DIR / "market_cache.json")
                 packet = builder.build("10:30", include_intraday=False, persist=False)
                 self.assertEqual(builder.secondary_calls, 0)
-                self.assertEqual(packet["source_health"][1]["status"], "not_called")
+                self.assertEqual(packet["source_health"][1]["status"], "disabled")
                 self.assertTrue(packet["instruments"][0]["quote"]["tradeable"])
             finally:
                 (state.ROOT, state.STATE_DIR, state.RECORDS_DIR, state.JOURNAL_DIR, state.ACCOUNT_PATH, state.WATCHLIST_PATH, state.SETTINGS_PATH) = original
@@ -153,6 +161,47 @@ class MarketPacketTests(unittest.TestCase):
                 self.assertIsNone(packet["packet_path"])
                 self.assertFalse((state.STATE_DIR / "market_cache.json").exists())
                 self.assertFalse((state.RECORDS_DIR / "market_packets").exists())
+            finally:
+                (state.ROOT, state.STATE_DIR, state.RECORDS_DIR, state.JOURNAL_DIR, state.ACCOUNT_PATH, state.WATCHLIST_PATH, state.SETTINGS_PATH) = original
+
+    def test_sector_proxy_uses_audited_membership_and_tencent_quotes(self):
+        now = market_packet.shanghai_now().replace(microsecond=0)
+
+        class TencentOnlyBuilder(market_packet.MarketPacketBuilder):
+            def _fetch_tencent_latest(self, codes):
+                result = {}
+                for index, requested in enumerate(codes):
+                    code = requested[2:] if requested.startswith(("sh", "sz")) else requested
+                    result[code] = {
+                        "code": code, "name": code, "last_price": 10 + index / 10,
+                        "previous_close": 10, "quote_timestamp": now.isoformat(),
+                        "amount_cny": 1_000_000 + index, "volume_lots": 1000,
+                        "source": "腾讯实时行情",
+                    }
+                return result
+
+            def _fetch_tencent_kline(self, code):
+                return []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = (state.ROOT, state.STATE_DIR, state.RECORDS_DIR, state.JOURNAL_DIR, state.ACCOUNT_PATH, state.WATCHLIST_PATH, state.SETTINGS_PATH)
+            try:
+                state.ROOT, state.STATE_DIR, state.RECORDS_DIR, state.JOURNAL_DIR = root, root / "state", root / "records", root / "journal"
+                state.ACCOUNT_PATH, state.WATCHLIST_PATH, state.SETTINGS_PATH = state.STATE_DIR / "account.json", state.STATE_DIR / "watchlist.json", state.STATE_DIR / "settings.json"
+                state.initialize(now.date().isoformat(), 1000, [{"code": "600000", "name": "测试", "shares": 100, "cost": 10, "sector": "银行"}])
+                state.update_sector_universe(
+                    [{"name": "银行", "constituents": [{"code": "600000"}, {"code": "601398"}, {"code": "000001"}]}],
+                    [{"name": "人工核验源", "captured_at": now.isoformat(), "data_as_of": now.date().isoformat(), "status": "online", "completeness_ratio": 1.0, "consecutive_successes": 2}],
+                    now.date().isoformat(), now.date().isoformat(), "测试",
+                )
+                packet = TencentOnlyBuilder(cache_path=state.STATE_DIR / "market_cache.json").build("manual", include_intraday=False, persist=False)
+                sector = packet["sector_context"]["sectors"][0]
+                self.assertEqual(packet["source_policy"]["intraday_primary"], "腾讯")
+                self.assertEqual(packet["source_health"][1]["status"], "disabled")
+                self.assertEqual(sector["status"], "ready")
+                self.assertEqual(sector["fresh_tencent_quotes"], 3)
+                self.assertEqual(sector["tracked_stock_ranks"][0]["code"], "600000")
             finally:
                 (state.ROOT, state.STATE_DIR, state.RECORDS_DIR, state.JOURNAL_DIR, state.ACCOUNT_PATH, state.WATCHLIST_PATH, state.SETTINGS_PATH) = original
 

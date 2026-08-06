@@ -48,6 +48,14 @@ class TradingLogicTests(unittest.TestCase):
         self.assertTrue(trading_logic.update_gate(20, True, 0.1)["allowed"])
         self.assertFalse(trading_logic.update_gate(20, False, 0.1)["allowed"])
 
+    def test_instruction_format_has_exactly_five_fields(self):
+        line = trading_logic.format_trade_instruction({
+            "valid_from": "10:35", "valid_until": "10:40", "code": "600000", "name": "浦发银行",
+            "side": "sell", "limit_price": 10.23, "requested_shares": 200, "feedback_deadline": "10:45",
+        })
+        self.assertEqual(line, "10:35-10:40，600000 浦发银行，卖 10.230 元，200 股，等待反馈至 10:45")
+        self.assertEqual(len(line.split("，")), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
