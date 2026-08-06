@@ -1,48 +1,39 @@
-# 每日任务调度协议 v2.5.0
+# 独立节点启动与当日任务投递协议 v3.0.0
 
-后台节点以同一个持久调度任务内的定时唤醒方式运行，只负责确定性地把当前有效节点投递到当天唯一的 `A股交易台 YYYY-MM-DD` 任务，不在调度任务内分析行情或创建订单。不得为每个节点创建独立 standalone 任务窗口。状态分为 `delivery`（目标任务已实际接收）和 `analysis`（分析已完成留档）；二者不得混用。
+本提示由一个 **standalone 定时自动化** 在八个交易节点触发。每次触发都是短生命周期节点任务；不得创建或复用跨日“持久调度器”。每天只复用当天唯一的 `A股交易台 YYYY-MM-DD` 分析任务，次日必须新建并登记新的分析任务。
 
-## 一、强制时间门禁
+## 一、打开 Codex 后的回溯门禁
 
-1. 第一项外部动作是取得北京时间日期并调用 `dispatch_node_claim(day=今天, node=本任务节点)`；门禁前不得搜行情或读取任务。
-2. `action=skip` 时只报告跳过原因并结束，不创建每日任务，不补发历史节点。
-3. 只有 `action=execute` 才继续。工具异常时关闭式退出。
-4. 门禁只允许截至当前最近的到期节点。例如调度延迟到 09:28 时，09:08 唤醒只返回 `skip`，只有 09:22 继续；12:13 只允许 11:25，后续 13:00 仍可独立执行。
-5. 认领使用 180 秒租约。同一节点租约内禁止并发；若租约过期且尚未产生投递记录，允许同一节点恢复执行，避免创建任务前的基础设施失败永久锁死当天节点。
+1. 第一项外部动作是取得北京时间。按照本地设置中的八个节点，计算今天截至当前最近的到期节点 `effective_node`。
+2. 直接调用 `dispatch_node_claim(day=北京时间今天, node=effective_node)`，不要使用自动化原计划时刻作为 node。这样，Codex 恢复后即使同时补跑多个错过的定时触发，也只允许其中一个执行最近节点。
+3. `action=skip` 时立即结束，不创建分析任务、不投递、不补发更早节点。能取得当前节点任务 ID 时将这个一次性节点任务归档。
+4. `action=execute` 才继续。原子认领和180秒租约负责去重；门禁前禁止搜索行情、创建任务或写投递状态。
+5. 首节点尚未到时、日期不是北京时间今天或工具异常均关闭式退出。交易日核验失败时只记录非交易日并结束。
 
-## 二、取得一个可投递的每日任务
+## 二、创建或复用当天唯一分析任务
 
-1. 核验 A 股交易日后调用 `task_session_get`。
-2. 登记存在时，先对登记的 `thread_id` 调用 `set_thread_archived(archived=false)`，再用 `read_thread` 或 `wait_threads(timeoutMs=0)` 验证任务可访问，并保存返回的 cursor。解除归档返回 `no archived rollout found` 或同义的“没有归档记录”表示任务本来就处于活动状态，必须继续读取验证，不能当作失败；验证返回 `status=notLoaded` 表示可冷启动的正常状态，也允许继续发送。只有任务读取/查找明确返回 not found/deleted 才表示目标不存在。禁止只相信本地登记中的 `status=active`。
-3. 取消归档明确返回 not found/deleted 时才创建替代任务；其他异常不得重复创建。
-4. 登记缺失或旧任务明确不存在时，当前有效节点必须立即执行以下首次启动流程，不得只报告 `status=missing`：
-   - 创建项目本地任务，标题为 `A股交易台 YYYY-MM-DD`；初始提示只回复 `DAILY_TASK_READY`，不分析行情。
-   - 等待初始化回合完成。
-   - 初始化完成后显式调用 `set_thread_archived(archived=false)`，再验证任务可访问。
-   - 最后调用 `task_session_register(..., replace=旧登记是否存在)`。未完成解归档和可访问性验证不得登记；登记成功后再进入 `node_delivery_prepare`。
-   - 若调度任务缺少 `create_thread`、`read_thread`、`wait_threads` 或 `send_message_to_thread`，这是调度面配置错误；结束本次执行且不得创建投递记录。认领租约过期后允许恢复，不能把 `status=missing` 当作正常完成。
-5. 每次发送确认或分析前都再次幂等调用 `set_thread_archived(archived=false)`。每日任务自身永不由调度器归档。
+1. 调用 `task_session_get(day=今天)`。
+2. 登记存在时，先 `set_thread_archived(archived=false)`，再用 `read_thread` 或 `wait_threads(timeoutMs=0)` 验证。`notLoaded` 或“本来未归档”属于可继续状态；只有明确 not found/deleted 才算失效。
+3. 登记缺失时，本节点必须创建项目本地任务，标题 `A股交易台 YYYY-MM-DD`，初始化提示为：
+   `你是今天唯一的A股分析任务。确认 analysis_protocol_get 与 node_packet_get 可用；不得用 Shell 读取协议。本回合仅回复 DAILY_TASK_READY。后续节点都在此任务分析，任务不得自行归档。`
+4. 等待初始化完成，解除归档并验证可访问后，调用 `task_session_register` 登记 thread_id/host_id。旧登记明确失效时才允许 `replace=true`。
+5. 分析任务按日期隔离：严禁把昨天或其他日期的 thread_id 登记给今天。
 
-## 三、真实投递确认
+## 三、投递确认与分析完成是两个状态
 
-1. 调用 `node_delivery_prepare` 并保存 `delivery_id`；初始状态必须是 `delivery=pending`、`analysis=pending`。
-2. 记录目标任务当前 cursor，然后调用 `send_message_to_thread` 发送一个无工具短消息：
-   `仅回复 DELIVERY_ACK <delivery_id>；不得调用工具或分析行情。`
-3. `send_message_to_thread` 返回只表示消息已进入队列，不表示目标已回复。必须使用 `wait_threads` 携带发送前 cursor 等待目标新回合完成；单次等待不超过 60 秒，可重复一次。
-4. 只有目标最终文本严格包含 `DELIVERY_ACK <delivery_id>`，调度器才调用 `node_delivery_confirm(..., transport_id="thread-message:<目标turn_id>")`。确认工具由调度器调用，不依赖每日任务拥有新增状态工具。
-5. 目标不可访问、等待两次仍超时、目标回合失败或 ACK 不匹配时，调用 `node_delivery_fail` 写入明确原因并结束。不得永久保留 pending，不得进入分析。
+1. 调用 `node_delivery_prepare`，取得 `delivery_id`；此时必须是 `delivery=pending, analysis=pending`。
+2. 记录目标 cursor，向当日任务发送：`仅回复 DELIVERY_ACK <delivery_id>，不得调用工具。`
+3. 用携带旧 cursor 的 `wait_threads` 等待目标新回合。只有目标最终文本含完全匹配的 ACK，才调用 `node_delivery_confirm`。两次各不超过60秒；明确失败或仍无 ACK 时调用 `node_delivery_fail`，不得留下永久 pending。
+4. ACK 确认后生成唯一 `run_id`，向同一当日任务发送完整请求，必须包含 day、effective_node、delivery_id、run_id，并要求它：
+   - 先调用 `analysis_protocol_get` 一次取得四份协议和活动策略，禁止用 Shell 读本地文件；
+   - 调用 `context_get(day=今天)` 一次取得账户和完整候选池，不再重复调用 `candidate_pool_get`；
+   - 调用 `node_packet_get(node=effective_node, include_intraday=true, persist=true)`；
+   - 完成人类交易员式分析；
+   - 调用 `analysis_run_record` 保存结构化证据和用户文本；
+   - 最后调用 `node_analysis_complete(status=completed, 同一 delivery_id/run_id)`。
+5. 节点任务可等待分析任务完成以转述结果；分析仍运行时不得因固定90秒上限误报失败。只有目标明确失败/取消，才由节点调用 `node_analysis_complete(status=failed)`。
+6. 最终用 `node_execution_status_get` 报告真实状态。delivery 与 analysis 绝不互相代替。
 
-## 四、独立分析完成
+## 四、分析边界
 
-1. 投递确认后生成唯一 `run_id`，再次解归档每日任务，并发送完整节点分析请求。请求必须包含 day、node、delivery_id 和 run_id。
-2. 目标任务读取 `prompts/global_policy.md`、`prompts/data_acquisition.md`、`prompts/daily_nodes.md`，读取确定性上下文；调用 MCP 工具 `node_packet_get(node=当前节点, include_intraday=true, persist=true)`，按节点要求刷新并形成建议。无人值守节点禁止通过 Shell 运行 `python -m trading_desk.cli node-packet`，避免触发审批等待。
-3. 目标任务必须调用 `analysis_run_record(day, run_id, payload)`，但不负责调用 `node_analysis_complete`。
-4. 调度器用 `wait_threads` 等待分析回合完成。单次等待不超过 60 秒；等待期间可报告进度，不以原 90 秒投递上限截断分析。
-5. 目标回合完成后，调度器调用 `node_analysis_complete(status=completed, run_id=同一值)`；该工具会校验 `analysis_run_record` 已存在。目标失败、超时或未留档时登记 `status=failed`。
-6. 最后调用 `node_execution_status_get`，分别报告 delivery 和 analysis。只有 `confirmed/completed` 才算节点成功。
-
-## 五、节点分析边界
-
-完整分析请求必须先调用 `node_packet_get`；该工具由确定性程序拉取持仓与候选池数据，不经过 LLM，也不需要 Shell 审批。
-
-结构化行情、分时、持仓和候选以数据包为准；LLM 只补充公告与权威消息。腾讯主源合规时不调用备用报价；单一合规来源且 `tradeable=true` 可生成精确建议。严格执行 T+1、委托锁定、策略和节点时间窗，只生成待人工执行建议，绝不连接券商下单。
+结构化报价、指数、分时、日K和本地技术特征只来自 `node_packet_get`；协议只来自 `analysis_protocol_get`。禁止任何 Shell、禁止模型重复拉行情。腾讯主源合规即停止备用报价；任一合规来源 `tradeable=true` 即可给精确建议。LLM只补充少量公告和权威消息，并且绝不连接券商自动下单。

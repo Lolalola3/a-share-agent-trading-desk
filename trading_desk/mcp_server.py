@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import traceback
+from pathlib import Path
 from typing import Any, Callable
 
 from . import reports, state, trading_logic
@@ -18,6 +19,7 @@ if hasattr(sys.stdin, "reconfigure"):
 TOOLS = [
     {"name": "account_get", "description": "读取账户主档案，包括资金、可卖股份和未反馈委托锁定。", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "context_get", "description": "读取本次盘面分析必须使用的固定上下文。", "inputSchema": {"type": "object", "properties": {"day": {"type": "string"}}}},
+    {"name": "analysis_protocol_get", "description": "一次性读取无人值守节点所需的四份提示协议和当前策略，避免通过 Shell 读取本地文件而触发审批。", "inputSchema": {"type": "object", "properties": {}}},
     {"name": "node_packet_get", "description": "由确定性程序拉取持仓与候选池的节点数据包，避免无人值守任务通过 Shell 触发审批。腾讯合规时立即采用，仅失败时使用备用源。", "inputSchema": {"type": "object", "required": ["node"], "properties": {"node": {"type": "string", "enum": ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]}, "include_intraday": {"type": "boolean"}, "persist": {"type": "boolean"}}}},
     {"name": "dispatch_node_claim", "description": "后台调度任务的第一道时间门禁。按北京时间原子认领截至当前最近的到期节点；过期、未来或重复节点返回skip且不得创建任务。", "inputSchema": {"type": "object", "required": ["day", "node"], "properties": {"day": {"type": "string"}, "node": {"type": "string", "enum": ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]}}}},
     {"name": "task_session_get", "description": "读取指定交易日唯一交易线程的本地登记；用于各独立定时节点复用同一线程。", "inputSchema": {"type": "object", "required": ["day"], "properties": {"day": {"type": "string"}}}},
@@ -48,6 +50,18 @@ TOOLS = [
 ]
 
 
+def analysis_protocol_pack() -> dict[str, Any]:
+    prompt_root = Path(__file__).resolve().parent.parent / "prompts"
+    names = ("daily_dispatcher.md", "global_policy.md", "data_acquisition.md", "daily_nodes.md")
+    return {
+        "prompt_workflow_version": "4.0.0",
+        "runtime_setting_version": state.get_settings().get("prompt_workflow_version"),
+        "prompts": {name: (prompt_root / name).read_text(encoding="utf-8") for name in names},
+        "strategy": trading_logic.load_logic(),
+        "instruction": "本工具是无人值守任务的协议入口；不得再用 Shell 读取这四个文件。",
+    }
+
+
 def call_tool(name: str, args: dict[str, Any]) -> Any:
     def build_node_packet() -> dict[str, Any]:
         from .market_packet import MarketPacketBuilder
@@ -60,6 +74,7 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     handlers: dict[str, Callable[[], Any]] = {
         "account_get": state.get_account,
         "context_get": lambda: state.context_pack(args.get("day")),
+        "analysis_protocol_get": analysis_protocol_pack,
         "node_packet_get": build_node_packet,
         "dispatch_node_claim": lambda: state.claim_dispatch_node(args["day"], args["node"]),
         "task_session_get": lambda: state.get_task_session(args["day"]),

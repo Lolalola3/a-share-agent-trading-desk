@@ -62,7 +62,7 @@ def default_settings() -> dict[str, Any]:
         "allowed_code_prefixes": ["600", "601", "603", "605", "000", "001", "002", "003"],
         "session_schedule": SESSION_SCHEDULE,
         "mandatory_context_days": 5,
-        "prompt_workflow_version": "2.1.1",
+        "prompt_workflow_version": "4.0.0",
         "candidate_pool": {
             "frequency": "每周日 17:00，必要时盘后应急重筛",
             "sector_count": 5,

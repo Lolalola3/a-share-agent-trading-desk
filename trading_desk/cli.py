@@ -28,6 +28,10 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--positions", required=True, help="JSON string or path")
     commands.add_parser("account")
     commands.add_parser("context")
+    packet = commands.add_parser("node-packet", help="拉取持仓与候选池行情并生成 Agent 数据包")
+    packet.add_argument("--node", required=True, choices=state.SESSION_SCHEDULE)
+    packet.add_argument("--without-intraday", action="store_true", help="只拉取批量实时行情，不拉取分时摘要")
+    packet.add_argument("--ephemeral", action="store_true", help="仅输出临时数据包，不写缓存或归档")
     intent = commands.add_parser("intent")
     intent.add_argument("--code", required=True)
     intent.add_argument("--name", required=True)
@@ -72,6 +76,13 @@ def main() -> None:
             result = state.get_account()
         elif args.command == "context":
             result = state.context_pack()
+        elif args.command == "node-packet":
+            from .market_packet import MarketPacketBuilder
+            result = MarketPacketBuilder().build(
+                args.node,
+                include_intraday=not args.without_intraday,
+                persist=not args.ephemeral,
+            )
         elif args.command == "intent":
             result = state.create_order_intent(args.code, args.name, args.side, args.price, args.shares, args.valid_from, args.valid_until, args.reason, args.run_id)
         elif args.command == "feedback":

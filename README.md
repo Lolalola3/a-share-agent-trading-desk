@@ -6,7 +6,7 @@
 
 ## 为什么是 Agent Harness
 
-- **Orchestration**：Scheduler、原子 Dispatcher 和每日唯一分析任务组成可恢复的多节点运行框架。
+- **Orchestration**：独立节点自动化、原子时间门禁和每日唯一分析任务组成可恢复的多节点运行框架，不复用跨日调度窗口。
 - **Tool contract**：MCP stdio server 为账户、候选池、策略检查、订单意图、成交反馈和归档提供结构化接口。
 - **Deterministic state**：资金、股份、T+1、未反馈委托锁定和策略版本由程序维护，不从对话历史推断。
 - **Guardrails**：Agent 的建议必须经过风险规则和状态校验；关键证据不足时拒绝生成新买入或伪精确指令。
@@ -16,7 +16,8 @@
 
 ## 核心边界
 
-- **Agent 层**：按 Prompt 选择行情、K线、板块、公告和新闻来源，负责重试、降级、解释与建议。
+- **Agent 层**：只补充少量公告和权威消息，解释程序数据包并生成建议。
+- **行情程序**：批量报价、并发分时/日K、按日缓存和本地技术指标；腾讯合规时不调用备用报价。
 - **确定性核心**：维护账户、T+1、未反馈委托锁定、候选池、风险纪律、节点认领和审计归档。
 - **外部适配器**：行情与新闻工具不与核心耦合；单源失败不能阻断其他类别和归档。
 - **人工执行**：建议必须给出明确限价、股数、时段与失效条件，但不会提交到券商。
@@ -24,7 +25,8 @@
 ```mermaid
 flowchart LR
     S[Scheduler] --> A[Analysis Agent]
-    A --> D[Market data adapters]
+    S --> D[Deterministic market packet]
+    D --> A
     A --> M[MCP deterministic core]
     M --> P[Private local state]
     M --> R[Risk and T+1 checks]
@@ -36,6 +38,8 @@ flowchart LR
 ## Harness 能力
 
 - 每个交易日复用唯一分析任务，多个时间节点独立触发。
+- 无跨日持久调度器；恢复运行时按实际北京时间认领最近到期节点。
+- 内置持仓/候选行情、分时、日K、指数代理和本地技术/相对强弱特征。
 - 原子节点认领：错过早盘节点不影响后续节点，历史节点不会补发过期指令。
 - 每周候选池漏斗：板块硬筛、每板块最多10只、固定评分、最多5只候选。
 - 固定止损、分级止盈、移动止盈、仓位风险预算和双向做T检查。
@@ -76,13 +80,14 @@ python -m trading_desk.mcp_server
 - [调度与每日唯一任务](prompts/daily_dispatcher.md)
 - [每周候选池筛选](prompts/weekly_candidate_screen.md)
 
-外部行情技能或 API 不随本仓库提供。接入时应遵守数据采集协议：分类取数、当前节点重新采集、腾讯主源成功即停止、失败时限时降级，以及单一合规来源即可进入精确指令流程。
+仓库内置公开行情适配器，不需要把结构化行情交给 LLM。使用时仍应遵守数据采集协议：腾讯主源成功即停止、失败时限时降级、单一合规来源即可进入精确指令流程。
 
 ## 文档
 
 - [Agent Harness 定位](docs/AGENT_HARNESS.md)
 - [架构说明](docs/ARCHITECTURE.md)
 - [自动任务设计](docs/AUTOMATIONS.md)
+- [人类交易员数据矩阵](docs/TRADER_DATA_MATRIX.md)
 - [隐私与安全](SECURITY.md)
 
 ## 隐私
