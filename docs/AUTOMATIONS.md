@@ -15,9 +15,9 @@
 
 ## One task per day
 
-每个定时器只负责认领节点和投递，不自行分析。当天第一个成功触发的节点创建并登记分析任务；后续节点继续投递到同一任务。若早盘节点缺失，最近到期节点仍能独立创建或找回当天任务。
+所有时间点都作为同一个持久调度任务内的定时唤醒运行，不能配置成 8 个各自新建窗口的 standalone 定时任务。每次唤醒只负责认领节点和投递，不自行分析；调度延迟造成多个时间点同时唤醒时，原子门禁只允许最近的到期节点继续。当天第一个成功触发的有效节点必须创建、验证并登记分析任务，后续节点继续投递到同一任务。若早盘节点缺失，最近到期节点仍能独立创建或找回当天任务。
 
-调度结果使用两段独立状态。调度器每次投递前显式取消每日任务归档并验证可访问性；解归档后的 `notLoaded` 是允许继续投递的正常冷启动状态。目标短回合返回带 `delivery_id` 的 ACK 后，由调度器写入 `delivery.status=confirmed`。随后目标完成 `analysis_run_record`，再由调度器写入 `analysis.status=completed`。完整分析不受旧的 90 秒投递上限约束；明确失败写为 `failed`，不得永久停留在 `pending`。状态保存在 `state/node_executions/YYYY-MM-DD/HHMM.json`。
+调度结果使用两段独立状态。节点认领带 180 秒租约；创建投递记录前失败时，租约过期后允许恢复，不能永久锁死节点。调度器每次投递前显式取消每日任务归档并验证可访问性；解归档后的 `notLoaded` 是允许继续投递的正常冷启动状态。目标短回合返回带 `delivery_id` 的 ACK 后，由调度器写入 `delivery.status=confirmed`。随后目标完成 `analysis_run_record`，再由调度器写入 `analysis.status=completed`。完整分析不受旧的 90 秒投递上限约束；明确失败写为 `failed`，不得永久停留在 `pending`。状态保存在 `state/node_executions/YYYY-MM-DD/HHMM.json`。
 
 ## Timing
 

@@ -103,7 +103,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(current["action"], "execute")
         duplicate = state.claim_dispatch_node("2026-08-04", "11:25", now)
         self.assertEqual(duplicate["action"], "skip")
-        self.assertIn("已认领", duplicate["reason"])
+        self.assertIn("认领", duplicate["reason"])
 
     def test_next_real_node_remains_independent(self):
         before = datetime(2026, 8, 4, 12, 13)
@@ -112,6 +112,31 @@ class StateTests(unittest.TestCase):
         result = state.claim_dispatch_node("2026-08-04", "13:00", after)
         self.assertEqual(result["action"], "execute")
         self.assertEqual(result["effective_node"], "13:00")
+
+    def test_expired_claim_without_delivery_can_resume(self):
+        first = state.claim_dispatch_node(
+            "2026-08-04", "09:22", datetime(2026, 8, 4, 9, 22)
+        )
+        resumed = state.claim_dispatch_node(
+            "2026-08-04", "09:22", datetime(2026, 8, 4, 9, 26)
+        )
+        self.assertEqual(first["action"], "execute")
+        self.assertEqual(resumed["action"], "execute")
+        self.assertTrue(resumed["resumed"])
+        self.assertEqual(resumed["attempt"], 2)
+        self.assertNotEqual(first["claim_id"], resumed["claim_id"])
+
+    def test_expired_claim_with_delivery_cannot_resume(self):
+        first = state.claim_dispatch_node(
+            "2026-08-04", "09:22", datetime(2026, 8, 4, 9, 22)
+        )
+        state.prepare_node_delivery("2026-08-04", "09:22", "daily-thread")
+        duplicate = state.claim_dispatch_node(
+            "2026-08-04", "09:22", datetime(2026, 8, 4, 9, 26)
+        )
+        self.assertEqual(first["action"], "execute")
+        self.assertEqual(duplicate["action"], "skip")
+        self.assertIn("投递记录", duplicate["reason"])
 
     def test_previous_day_backlog_is_rejected(self):
         result = state.claim_dispatch_node(

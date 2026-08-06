@@ -1,24 +1,26 @@
-# 每日任务调度协议 v2.3.1
+# 每日任务调度协议 v2.4.0
 
-后台节点只负责确定性地把当前节点投递到当天唯一的 `A股交易台 YYYY-MM-DD` 任务，不在调度任务内分析行情或创建订单。状态分为 `delivery`（目标任务已实际接收）和 `analysis`（分析已完成留档）；二者不得混用。
+后台节点以同一个持久调度任务内的定时唤醒方式运行，只负责确定性地把当前有效节点投递到当天唯一的 `A股交易台 YYYY-MM-DD` 任务，不在调度任务内分析行情或创建订单。不得为每个节点创建独立 standalone 任务窗口。状态分为 `delivery`（目标任务已实际接收）和 `analysis`（分析已完成留档）；二者不得混用。
 
 ## 一、强制时间门禁
 
 1. 第一项外部动作是取得北京时间日期并调用 `dispatch_node_claim(day=今天, node=本任务节点)`；门禁前不得搜行情或读取任务。
 2. `action=skip` 时只报告跳过原因并结束，不创建每日任务，不补发历史节点。
 3. 只有 `action=execute` 才继续。工具异常时关闭式退出。
-4. 门禁只允许截至当前最近的到期节点。例如 12:13 只允许 11:25；后续 13:00 仍可独立执行。
+4. 门禁只允许截至当前最近的到期节点。例如调度延迟到 09:28 时，09:08 唤醒只返回 `skip`，只有 09:22 继续；12:13 只允许 11:25，后续 13:00 仍可独立执行。
+5. 认领使用 180 秒租约。同一节点租约内禁止并发；若租约过期且尚未产生投递记录，允许同一节点恢复执行，避免创建任务前的基础设施失败永久锁死当天节点。
 
 ## 二、取得一个可投递的每日任务
 
 1. 核验 A 股交易日后调用 `task_session_get`。
 2. 登记存在时，先对登记的 `thread_id` 调用 `set_thread_archived(archived=false)`，再用 `read_thread` 或 `wait_threads(timeoutMs=0)` 验证任务可访问，并保存返回的 cursor。解除归档后返回 `status=notLoaded` 表示可冷启动的正常状态，允许继续发送；只有明确的 not found/deleted 才表示目标不存在。禁止只相信本地登记中的 `status=active`。
 3. 取消归档明确返回 not found/deleted 时才创建替代任务；其他异常不得重复创建。
-4. 登记缺失或旧任务明确不存在时：
+4. 登记缺失或旧任务明确不存在时，当前有效节点必须立即执行以下首次启动流程，不得只报告 `status=missing`：
    - 创建项目本地任务，标题为 `A股交易台 YYYY-MM-DD`；初始提示只回复 `DAILY_TASK_READY`，不分析行情。
    - 等待初始化回合完成。
    - 初始化完成后显式调用 `set_thread_archived(archived=false)`，再验证任务可访问。
-   - 最后调用 `task_session_register(..., replace=旧登记是否存在)`。未完成解归档和可访问性验证不得登记。
+   - 最后调用 `task_session_register(..., replace=旧登记是否存在)`。未完成解归档和可访问性验证不得登记；登记成功后再进入 `node_delivery_prepare`。
+   - 若调度任务缺少 `create_thread`、`read_thread`、`wait_threads` 或 `send_message_to_thread`，这是调度面配置错误；结束本次执行且不得创建投递记录。认领租约过期后允许恢复，不能把 `status=missing` 当作正常完成。
 5. 每次发送确认或分析前都再次幂等调用 `set_thread_archived(archived=false)`。每日任务自身永不由调度器归档。
 
 ## 三、真实投递确认

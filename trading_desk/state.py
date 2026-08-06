@@ -17,6 +17,7 @@ ACCOUNT_PATH = STATE_DIR / "account.json"
 WATCHLIST_PATH = STATE_DIR / "watchlist.json"
 SETTINGS_PATH = STATE_DIR / "settings.json"
 SESSION_SCHEDULE = ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]
+DISPATCH_CLAIM_LEASE_SECONDS = 180
 
 
 class DeskError(ValueError):
@@ -366,21 +367,82 @@ def claim_dispatch_node(day: str, node: str, current_time: datetime | None = Non
         state = _read_json(claim_path, {"day": day, "claims": {}})
         claims = dict(state.get("claims", {}))
         if node in claims:
+            existing_claim = dict(claims[node])
+            execution = _read_json(_node_execution_path(day, node))
+            if execution:
+                return {
+                    **base,
+                    "action": "skip",
+                    "reason": f"{node}节点已有投递记录，禁止重复投递。",
+                    "existing_claim": existing_claim,
+                }
+            lease_text = existing_claim.get("lease_expires_at")
+            if lease_text:
+                lease_expires_at = datetime.fromisoformat(lease_text)
+            else:
+                claimed_at = datetime.fromisoformat(existing_claim["claimed_at"])
+                lease_expires_at = claimed_at + timedelta(seconds=DISPATCH_CLAIM_LEASE_SECONDS)
+            if now < lease_expires_at:
+                return {
+                    **base,
+                    "action": "skip",
+                    "reason": f"{node}节点认领租约仍有效，禁止并发重复投递。",
+                    "existing_claim": existing_claim,
+                }
+            attempt = int(existing_claim.get("attempt", 1)) + 1
+            claimed_at = now.isoformat(timespec="seconds")
+            lease_expires_at = (now + timedelta(seconds=DISPATCH_CLAIM_LEASE_SECONDS)).isoformat(timespec="seconds")
+            claim_id = uuid.uuid4().hex[:16]
+            claims[node] = {
+                "claim_id": claim_id,
+                "claimed_at": claimed_at,
+                "lease_expires_at": lease_expires_at,
+                "status": "claimed",
+                "attempt": attempt,
+                "resumed_from": existing_claim.get("claim_id"),
+            }
+            _write_json(claim_path, {
+                "day": day,
+                "latest_claimed_node": node,
+                "updated_at": claimed_at,
+                "claims": claims,
+            })
             return {
                 **base,
-                "action": "skip",
-                "reason": f"{node}节点今日已认领，禁止重复投递。",
-                "existing_claim": claims[node],
+                "action": "execute",
+                "reason": f"{node}节点上一认领租约已过期且未产生投递记录，允许恢复执行。",
+                "claimed_at": claimed_at,
+                "lease_expires_at": lease_expires_at,
+                "claim_id": claim_id,
+                "attempt": attempt,
+                "resumed": True,
             }
         claimed_at = now.isoformat(timespec="seconds")
-        claims[node] = {"claimed_at": claimed_at, "status": "claimed"}
+        lease_expires_at = (now + timedelta(seconds=DISPATCH_CLAIM_LEASE_SECONDS)).isoformat(timespec="seconds")
+        claim_id = uuid.uuid4().hex[:16]
+        claims[node] = {
+            "claim_id": claim_id,
+            "claimed_at": claimed_at,
+            "lease_expires_at": lease_expires_at,
+            "status": "claimed",
+            "attempt": 1,
+        }
         _write_json(claim_path, {
             "day": day,
             "latest_claimed_node": node,
             "updated_at": claimed_at,
             "claims": claims,
         })
-        return {**base, "action": "execute", "reason": f"{node}是截至当前最近的到期节点，认领成功。", "claimed_at": claimed_at}
+        return {
+            **base,
+            "action": "execute",
+            "reason": f"{node}是截至当前最近的到期节点，认领成功。",
+            "claimed_at": claimed_at,
+            "lease_expires_at": lease_expires_at,
+            "claim_id": claim_id,
+            "attempt": 1,
+            "resumed": False,
+        }
     finally:
         os.close(lock_fd)
         try:
