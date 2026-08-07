@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trading_desk import state
+from trading_desk import reports, state
 
 
 class StateTests(unittest.TestCase):
@@ -33,6 +33,17 @@ class StateTests(unittest.TestCase):
         state.rollover("2026-08-07")
         self.assertEqual(state.get_account()["positions"][0]["sellable_shares"], 100)
 
+    def test_settings_migrate_legacy_heartbeat_runtime(self):
+        state._write_json(state.SETTINGS_PATH, {
+            "analysis_runtime": {
+                "mode": "first_open_then_resettable_timer",
+                "heartbeat_interval_minutes": 5,
+            }
+        })
+        runtime_settings = state.get_settings()["analysis_runtime"]
+        self.assertEqual(runtime_settings["mode"], "first_open_then_split_local_timer_monitor")
+        self.assertNotIn("heartbeat_interval_minutes", runtime_settings)
+
     def _candidate(self, code="000001", sector="银行II"):
         return {
             "code": code, "name": "测试股票", "sector": sector, "bucket": "core", "score": 75,
@@ -52,22 +63,35 @@ class StateTests(unittest.TestCase):
         with self.assertRaises(state.DeskError):
             state.register_task_session("2026-08-06", "thread-b")
 
-    def test_sector_universe_requires_audited_source_and_members(self):
-        payload = state.update_sector_universe(
-            [{"name": "银行", "constituents": [{"code": "601398"}, {"code": "600000"}, {"code": "000001"}]}],
-            [{"name": "核验源", "captured_at": "2026-08-06T17:00:00+08:00", "data_as_of": "2026-08-06", "status": "online", "completeness_ratio": 1.0, "consecutive_successes": 2}],
-            "2026-08-06", "2026-08-13", "周筛快照",
-        )
-        self.assertEqual(payload["sectors"][0]["constituent_count"], 3)
-        self.assertEqual(state.context_pack()["sector_universe"]["status"], "active")
+    def test_context_has_no_sector_membership_snapshot(self):
+        self.assertNotIn("sector_universe", state.context_pack())
 
-    def test_sector_universe_rejects_one_off_source_success(self):
+    def test_analysis_record_forces_complete_user_visible_chain(self):
+        payload = {
+            "data_health": {"quotes": "腾讯报价新鲜"},
+            "facts": ["事实A"],
+            "interpretation": ["解读A"],
+            "rules_applied": ["规则A"],
+            "conclusion": {
+                "trading_advice": "本轮无交易建议",
+                "reason": "没有触发规则。",
+                "instruction_lines": [],
+            },
+            "monitor_decision": {"rationale": "没有必要监控", "monitors": []},
+            "user_visible_summary": "旧式短摘要",
+        }
+        recorded = reports.record_analysis_run("2026-08-06", "run-output", payload)
+        output = recorded["user_visible_output"]
+        for heading in ("## 事实", "## 解读", "## 规则", "## 结论"):
+            self.assertIn(heading, output)
+        saved = state._read_json(Path(recorded["path"]))
+        self.assertEqual(saved["user_visible_output"], output)
+        journal = (state.JOURNAL_DIR / "daily" / "2026-08-06.md").read_text(encoding="utf-8")
+        self.assertIn("## 事实", journal)
+
+    def test_summary_only_analysis_record_is_rejected(self):
         with self.assertRaises(state.DeskError):
-            state.update_sector_universe(
-                [{"name": "银行", "constituents": [{"code": "601398"}, {"code": "600000"}, {"code": "000001"}]}],
-                [{"name": "不稳定源", "captured_at": "2026-08-06T17:00:00+08:00", "data_as_of": "2026-08-06", "status": "online", "completeness_ratio": 1.0, "consecutive_successes": 1}],
-                "2026-08-06", "2026-08-13", "不得写入",
-            )
+            reports.record_analysis_run("2026-08-06", "run-summary", {"summary": "只有摘要"})
 
 
 if __name__ == "__main__":

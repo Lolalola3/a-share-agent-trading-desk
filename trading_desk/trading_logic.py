@@ -8,7 +8,7 @@ from typing import Any
 from . import state
 
 
-LOGIC_PATH = state.PACKAGE_ROOT / "strategy" / "active_logic.json"
+LOGIC_PATH = state.ROOT / "strategy" / "active_logic.json"
 
 
 def load_logic() -> dict[str, Any]:

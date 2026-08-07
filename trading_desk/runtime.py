@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import monitoring, reports, state
+from . import monitoring, reports, state, wakeup
 
 
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -20,13 +20,15 @@ def shanghai_now() -> datetime:
 
 
 def load_config() -> dict[str, Any]:
-    path = state.PACKAGE_ROOT / "config" / "runtime.json"
+    path = state.ROOT / "config" / "runtime.json"
     defaults = {
         "analysis_interval_minutes": 60,
-        "heartbeat_interval_minutes": 5,
         "analysis_lease_minutes": 15,
         "failed_retry_minutes": 10,
+        "earliest_analysis_time": "09:15",
+        "continuous_session_start_time": "09:30",
         "market_close_time": "15:00",
+        "local_monitor_poll_seconds": 30,
     }
     if not path.exists():
         return defaults
@@ -43,27 +45,76 @@ def _normalize_now(value: datetime | None) -> datetime:
     return current.replace(tzinfo=SHANGHAI) if current.tzinfo is None else current.astimezone(SHANGHAI)
 
 
-def market_phase(value: datetime | None = None) -> dict[str, Any]:
+def _session_time(day: str, hm: str) -> datetime:
+    try:
+        return datetime.fromisoformat(f"{day}T{hm}:00").replace(tzinfo=SHANGHAI)
+    except ValueError as exc:
+        raise state.DeskError(f"运行时配置时间无效：{hm}") from exc
+
+
+def market_phase(value: datetime | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
     current = _normalize_now(value)
+    cfg = config or load_config()
     hm = current.strftime("%H:%M")
-    if hm < "09:15":
-        name = "pre_market"
-    elif hm < "09:30":
+    earliest = str(cfg["earliest_analysis_time"])
+    continuous_start = str(cfg["continuous_session_start_time"])
+    if hm < earliest:
+        name = "waiting_before_open"
+        analysis_mode = "waiting"
+    elif hm < continuous_start:
         name = "opening_auction"
+        analysis_mode = "pre_market"
     elif hm < "11:30":
         name = "morning_session"
+        analysis_mode = "intraday"
     elif hm < "13:00":
         name = "midday_break"
+        analysis_mode = "intraday"
     elif hm < "15:00":
         name = "afternoon_session"
+        analysis_mode = "intraday"
     else:
         name = "post_close"
-    allows_orders = ("09:25" <= hm < "11:25") or ("12:55" <= hm < "14:55")
+        analysis_mode = "close"
+    allows_orders = (continuous_start <= hm < "11:25") or ("13:00" <= hm < "14:55")
     return {
         "name": name,
+        "analysis_mode": analysis_mode,
         "as_of": current.isoformat(timespec="seconds"),
         "allows_new_orders": allows_orders,
+        "include_intraday": analysis_mode in {"intraday", "close"},
+        "analysis_prompt": "pre_market_session.md" if analysis_mode == "pre_market" else "daily_session.md",
         "requires_close_review": name == "post_close",
+    }
+
+
+def _ensure_trading_day(day: str) -> dict[str, Any]:
+    account = state.get_account()
+    account_day = str(account.get("as_of", ""))
+    if account_day == day:
+        return {"status": "current", "account_as_of": account_day}
+    try:
+        if account_day and datetime.fromisoformat(account_day).date() > datetime.fromisoformat(day).date():
+            return {
+                "status": "blocked",
+                "account_as_of": account_day,
+                "reason": "账户日期晚于目标交易日，禁止自动回退账户状态。",
+            }
+    except ValueError:
+        return {"status": "blocked", "account_as_of": account_day, "reason": "账户交易日格式无效。"}
+    pending = [item for item in account.get("pending_orders", []) if item.get("status") == "pending_feedback"]
+    if pending:
+        return {
+            "status": "blocked",
+            "account_as_of": account_day,
+            "pending_order_ids": [str(item.get("id", "")) for item in pending],
+            "reason": "存在未反馈委托，必须先核对成交或撤单，不能自动滚动交易日。",
+        }
+    rolled = state.rollover(day)
+    return {
+        "status": "rolled",
+        "account_as_of": str(rolled.get("as_of", day)),
+        "reason": "已在启动流程中自动完成交易日滚动与 T+1 可卖数量更新。",
     }
 
 
@@ -72,17 +123,22 @@ def get_session(day: str) -> dict[str, Any]:
     if session.get("status") == "missing":
         return session
     cfg = load_config()
-    return {
+    result = {
         "analysis_interval_minutes": cfg["analysis_interval_minutes"],
-        "heartbeat_interval_minutes": cfg["heartbeat_interval_minutes"],
         "last_analysis_at": None,
         "next_analysis_at": None,
         "close_completed_at": None,
-        "heartbeat_automation_id": None,
+        "wakeup_timer": wakeup.get_timer(),
+        "monitor_worker": wakeup.get_monitor(),
+        "rollover": None,
         "current_cycle": None,
         "cycle_history": [],
         **session,
     }
+    result.pop("heartbeat_interval_minutes", None)
+    result.pop("heartbeat_automation_id", None)
+    result.pop("sector_snapshot_maintenance", None)
+    return result
 
 
 def register_session(
@@ -93,38 +149,112 @@ def register_session(
     source: str = "daily_bootstrap",
     replace: bool = False,
 ) -> dict[str, Any]:
+    previous = state._read_json(_session_path(day), {})
     base = state.register_task_session(day, thread_id, host_id, title, source, replace)
-    existing = state._read_json(_session_path(day), {})
+    same_thread = previous.get("thread_id") == thread_id
     cfg = load_config()
+    rollover = _ensure_trading_day(day)
+    initial_due = _session_time(day, str(cfg["earliest_analysis_time"])).isoformat(timespec="seconds")
     session = {
-        **existing,
+        **previous,
         **base,
-        "analysis_interval_minutes": int(existing.get("analysis_interval_minutes", cfg["analysis_interval_minutes"])),
-        "heartbeat_interval_minutes": int(existing.get("heartbeat_interval_minutes", cfg["heartbeat_interval_minutes"])),
-        "last_analysis_at": existing.get("last_analysis_at"),
-        "next_analysis_at": existing.get("next_analysis_at"),
-        "close_completed_at": existing.get("close_completed_at"),
-        "heartbeat_automation_id": existing.get("heartbeat_automation_id"),
-        "current_cycle": existing.get("current_cycle"),
-        "cycle_history": list(existing.get("cycle_history", [])),
+        "analysis_interval_minutes": int(previous.get("analysis_interval_minutes", cfg["analysis_interval_minutes"])),
+        "last_analysis_at": previous.get("last_analysis_at"),
+        "next_analysis_at": previous.get("next_analysis_at") or initial_due,
+        "close_completed_at": previous.get("close_completed_at"),
+        "rollover": rollover,
+        "current_cycle": previous.get("current_cycle") if same_thread else None,
+        "cycle_history": list(previous.get("cycle_history", [])),
+        "wakeup_timer": wakeup.get_timer(),
+        "monitor_worker": wakeup.get_monitor(),
+        "delivery_mode": "split_local_timer_and_monitor",
     }
+    session.pop("heartbeat_interval_minutes", None)
+    session.pop("heartbeat_automation_id", None)
+    session.pop("sector_snapshot_maintenance", None)
     state._write_json(_session_path(day), session)
     return session
 
 
 def register_heartbeat(day: str, automation_id: str) -> dict[str, Any]:
-    session = get_session(day)
-    if session.get("status") == "missing":
-        raise state.DeskError("当日交易任务尚未登记。")
-    if not automation_id:
-        raise state.DeskError("心跳自动化 ID 不能为空。")
-    existing = session.get("heartbeat_automation_id")
-    if existing and existing != automation_id:
-        raise state.DeskError("当日任务已登记其他心跳自动化，禁止静默覆盖。")
-    session["heartbeat_automation_id"] = automation_id
-    session["updated_at"] = shanghai_now().isoformat(timespec="seconds")
-    state._write_json(_session_path(day), session)
-    return session
+    raise state.DeskError("5分钟聊天心跳已停用；请使用本地可重置唤醒器。")
+
+
+def migrate_session_delivery(day: str) -> dict[str, Any]:
+    """Migrate delivery to independent timer and monitor workers without claiming analysis."""
+    with _runtime_lock(day):
+        session = state.get_task_session(day)
+        if session.get("status") == "missing":
+            raise state.DeskError("当日交易任务尚未创建，无法迁移计时器。")
+        removed = []
+        for key in ("heartbeat_interval_minutes", "heartbeat_automation_id"):
+            if key in session:
+                removed.append(key)
+                session.pop(key, None)
+        next_due = session.get("next_analysis_at")
+        session["rollover"] = _ensure_trading_day(day)
+        session.pop("sector_snapshot_maintenance", None)
+        if session.get("status") == "closed" or not next_due:
+            cancelled = wakeup.cancel_all(day, "session_delivery_migration_closed")
+            timer = cancelled["timer"]
+            monitor_worker = cancelled["monitor"]
+        else:
+            timer = _ensure_wakeup(session, day, str(next_due), "session_delivery_migration")
+            monitor_worker = _ensure_monitor(session, day, "session_delivery_migration")
+        session["wakeup_timer"] = timer
+        session["monitor_worker"] = monitor_worker
+        session["delivery_mode"] = "split_local_timer_and_monitor"
+        session["updated_at"] = shanghai_now().isoformat(timespec="seconds")
+        state._write_json(_session_path(day), session)
+        return {
+            "day": day,
+            "status": "migrated",
+            "removed_fields": removed,
+            "next_analysis_at": next_due,
+            "wakeup_timer": timer,
+            "monitor_worker": monitor_worker,
+        }
+
+
+def _ensure_wakeup(session: dict[str, Any], day: str, run_at: str, reason: str) -> dict[str, Any]:
+    timer = wakeup.get_timer()
+    if (
+        timer.get("status") == "armed"
+        and timer.get("day") == day
+        and timer.get("thread_id") == session.get("thread_id")
+        and timer.get("run_at") == run_at
+    ):
+        return timer
+    return wakeup.arm(
+        day,
+        str(session.get("thread_id", "")),
+        run_at,
+        str(session.get("host_id", "local")),
+        reason,
+    )
+
+
+def _ensure_monitor(session: dict[str, Any], day: str, reason: str) -> dict[str, Any]:
+    plan = monitoring.get_plan(day)
+    active = [item for item in plan.get("monitors", []) if item.get("enabled", True)]
+    if not active:
+        return wakeup.cancel_monitor(day, "no_active_monitors")
+    monitor_worker = wakeup.get_monitor()
+    if (
+        monitor_worker.get("status") == "armed"
+        and monitor_worker.get("day") == day
+        and monitor_worker.get("thread_id") == session.get("thread_id")
+        and monitor_worker.get("plan_updated_at") == plan.get("updated_at")
+    ):
+        return monitor_worker
+    cfg = load_config()
+    return wakeup.arm_monitor(
+        day,
+        str(session.get("thread_id", "")),
+        str(session.get("host_id", "local")),
+        int(cfg["local_monitor_poll_seconds"]),
+        reason,
+    )
 
 
 @contextmanager
@@ -165,7 +295,7 @@ def _is_due(timestamp: str | None, now: datetime) -> bool:
 
 def poll(
     day: str,
-    source: str = "heartbeat",
+    source: str = "timer",
     force: bool = False,
     snapshot_provider: Callable[[list[str]], dict[str, dict[str, Any]]] | None = None,
     now: datetime | None = None,
@@ -187,7 +317,37 @@ def poll(
             else:
                 return {"action": "skip", "day": day, "reason": "当日收盘复盘已完成，计时器已暂停。", "session": session}
         cfg = load_config()
-        phase = market_phase(current)
+        phase = market_phase(current, cfg)
+        rollover = _ensure_trading_day(day)
+        session["rollover"] = rollover
+        if rollover["status"] == "blocked":
+            session["updated_at"] = current.isoformat(timespec="seconds")
+            state._write_json(_session_path(day), session)
+            return {
+                "action": "blocked",
+                "day": day,
+                "reason": rollover["reason"],
+                "rollover": rollover,
+                "phase": phase,
+            }
+        session.pop("sector_snapshot_maintenance", None)
+        earliest = _session_time(day, str(cfg["earliest_analysis_time"]))
+        if current < earliest:
+            session["next_analysis_at"] = earliest.isoformat(timespec="seconds")
+            session["wakeup_timer"] = _ensure_wakeup(
+                session, day, session["next_analysis_at"], "earliest_analysis_time"
+            )
+            session["monitor_worker"] = wakeup.cancel_monitor(day, "before_earliest_analysis_time")
+            session["updated_at"] = current.isoformat(timespec="seconds")
+            state._write_json(_session_path(day), session)
+            return {
+                "action": "skip",
+                "day": day,
+                "reason_code": "before_earliest_analysis_time",
+                "reason": f"最早分析时间为 {cfg['earliest_analysis_time']}；当前只保持日任务和本地静默唤醒器，不拉取行情、不执行分析。",
+                "next_analysis_at": session["next_analysis_at"],
+                "phase": phase,
+            }
         active_cycle = session.get("current_cycle") or {}
         if active_cycle.get("status") == "running":
             lease_until = datetime.fromisoformat(active_cycle["lease_until"])
@@ -222,6 +382,11 @@ def poll(
         if phase["requires_close_review"] and not session.get("close_completed_at"):
             reasons.append("market_close")
         if not reasons:
+            if session.get("next_analysis_at"):
+                session["wakeup_timer"] = _ensure_wakeup(
+                    session, day, str(session["next_analysis_at"]), "next_analysis_at"
+                )
+            session["monitor_worker"] = _ensure_monitor(session, day, "active_monitor_plan")
             session["updated_at"] = current.isoformat(timespec="seconds")
             state._write_json(_session_path(day), session)
             return {
@@ -243,6 +408,9 @@ def poll(
             "phase": phase,
             "monitor_signals": monitor_result.get("signals", []),
         }
+        cancelled = wakeup.cancel_all(day, f"analysis_claimed:{run_id}")
+        session["wakeup_timer"] = cancelled["timer"]
+        session["monitor_worker"] = cancelled["monitor"]
         session["current_cycle"] = cycle
         session["updated_at"] = current.isoformat(timespec="seconds")
         state._write_json(_session_path(day), session)
@@ -252,6 +420,9 @@ def poll(
             "run_id": run_id,
             "trigger_reasons": cycle["reasons"],
             "phase": phase,
+            "analysis_mode": phase["analysis_mode"],
+            "analysis_prompt": phase["analysis_prompt"],
+            "include_intraday": phase["include_intraday"],
             "close_required": phase["requires_close_review"],
             "monitor_result": monitor_result,
         }
@@ -279,6 +450,12 @@ def complete_cycle(
         run_paths = list((state.RECORDS_DIR / "runs" / day).glob(f"*_{run_id}.json"))
         if status == "completed" and not run_paths:
             raise state.DeskError("未找到对应 analysis_run_record，不能完成分析周期。")
+        user_visible_output: str | None = None
+        if status == "completed":
+            validated = reports.validate_analysis_record(
+                state._read_json(sorted(run_paths)[-1]), require_rendered=True
+            )
+            user_visible_output = validated["user_visible_output"]
         if close_session and status == "completed":
             report = state.JOURNAL_DIR / "daily" / f"{day}_summary.md"
             if not report.exists():
@@ -301,20 +478,46 @@ def complete_cycle(
             session["status"] = "closed"
             session["close_completed_at"] = current.isoformat(timespec="seconds")
             session["next_analysis_at"] = None
+            cancelled = wakeup.cancel_all(day, "close_session_completed")
+            session["wakeup_timer"] = cancelled["timer"]
+            session["monitor_worker"] = cancelled["monitor"]
             timer_action = "pause"
         else:
-            delay = int(cfg["analysis_interval_minutes"] if status == "completed" else cfg["failed_retry_minutes"])
-            session["next_analysis_at"] = (current + timedelta(minutes=delay)).isoformat(timespec="seconds")
-            timer_action = "keep_active"
+            if status == "completed" and (cycle.get("phase") or {}).get("analysis_mode") == "pre_market":
+                continuous_start = _session_time(day, str(cfg["continuous_session_start_time"]))
+                session["next_analysis_at"] = max(current, continuous_start).isoformat(timespec="seconds")
+                timer_action = "await_continuous_session"
+            else:
+                delay = int(cfg["analysis_interval_minutes"] if status == "completed" else cfg["failed_retry_minutes"])
+                next_due = current + timedelta(minutes=delay)
+                close_at = _session_time(day, str(cfg["market_close_time"]))
+                if status == "completed" and current < close_at < next_due:
+                    next_due = close_at
+                session["next_analysis_at"] = next_due.isoformat(timespec="seconds")
+                timer_action = "keep_active"
+            session["wakeup_timer"] = _ensure_wakeup(
+                session,
+                day,
+                str(session["next_analysis_at"]),
+                "continuous_session_start" if timer_action == "await_continuous_session" else "analysis_interval",
+            )
+            session["monitor_worker"] = _ensure_monitor(session, day, "analysis_cycle_completed")
         session["updated_at"] = current.isoformat(timespec="seconds")
         state._write_json(_session_path(day), session)
         return {
             "session": session,
             "cycle": cycle,
+            "user_visible_output": user_visible_output,
+            "display_contract": (
+                "本轮回复必须完整原样输出 user_visible_output，不得只发送 summary。"
+                if user_visible_output
+                else None
+            ),
             "timer": {
                 "action": timer_action,
-                "heartbeat_automation_id": session.get("heartbeat_automation_id"),
-                "heartbeat_interval_minutes": session.get("heartbeat_interval_minutes"),
+                "delivery": "split_local_timer_and_monitor",
+                "timer_worker_pid": (session.get("wakeup_timer") or {}).get("pid"),
+                "monitor_worker_pid": (session.get("monitor_worker") or {}).get("pid"),
                 "next_analysis_at": session.get("next_analysis_at"),
             },
         }

@@ -1,11 +1,12 @@
 {
   "analysis_interval_minutes": 60,
-  "heartbeat_interval_minutes": 5,
   "analysis_lease_minutes": 15,
   "failed_retry_minutes": 10,
+  "earliest_analysis_time": "09:15",
+  "continuous_session_start_time": "09:30",
+  "local_monitor_poll_seconds": 30,
   "market_close_time": "15:00",
-  "sector_quote_coverage_min": 0.8,
-  "sector_universe_max_age_days": 8,
   "tencent_batch_size": 50,
+  "tencent_batch_workers": 4,
   "non_tencent_intraday_fallback_enabled": false
 }

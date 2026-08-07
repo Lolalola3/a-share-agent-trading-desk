@@ -11,6 +11,88 @@ from . import state
 NEXT_DAY_SIDES = {"buy": "买入", "sell": "卖出", "hold": "持有", "watch": "观察"}
 
 
+def _non_empty_lines(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list):
+        raise state.DeskError(f"分析留档的{label}必须是非空列表。")
+    lines = [str(item).strip() for item in value if str(item).strip()]
+    if not lines:
+        raise state.DeskError(f"分析留档缺少{label}。")
+    return lines
+
+
+def _health_lines(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        lines = [f"{key}：{item}" for key, item in value.items() if item is not None and item != "" and item != []]
+    elif isinstance(value, list):
+        lines = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        lines = [str(value).strip()] if str(value).strip() else []
+    if not lines:
+        raise state.DeskError("分析留档缺少数据时点与健康状况。")
+    return lines
+
+
+def render_analysis_output(payload: dict[str, Any]) -> str:
+    """Render the complete user-facing evidence chain from structured fields."""
+    health = _health_lines(payload.get("data_health"))
+    facts = _non_empty_lines(payload.get("facts"), "事实")
+    interpretation = _non_empty_lines(payload.get("interpretation"), "解读")
+    rules = _non_empty_lines(payload.get("rules_applied"), "规则")
+    conclusion = payload.get("conclusion")
+    if not isinstance(conclusion, dict):
+        raise state.DeskError("分析结论必须是包含 trading_advice、reason 和 instruction_lines 的对象。")
+    advice = str(conclusion.get("trading_advice", "")).strip()
+    reason = str(conclusion.get("reason", "")).strip()
+    instruction_lines = [str(item).strip() for item in list(conclusion.get("instruction_lines") or []) if str(item).strip()]
+    if not advice or not reason:
+        raise state.DeskError("分析结论缺少交易建议或理由。")
+    if instruction_lines:
+        for line in instruction_lines:
+            if len(line.split("，")) != 5:
+                raise state.DeskError("交易建议必须严格包含五个中文逗号分隔字段。")
+    elif "无交易建议" not in advice:
+        raise state.DeskError("没有严格指令行时，结论必须明确“本轮无交易建议”。")
+    monitor = payload.get("monitor_decision")
+    if not isinstance(monitor, dict) or not str(monitor.get("rationale", "")).strip():
+        raise state.DeskError("分析留档缺少监控决策及理由。")
+    lines = ["## 数据时点与健康状况", ""]
+    lines.extend(f"- {item}" for item in health)
+    for title, values in (("事实", facts), ("解读", interpretation), ("规则", rules)):
+        lines.extend(["", f"## {title}", ""])
+        lines.extend(f"- {item}" for item in values)
+    lines.extend(["", "## 结论", "", f"- {advice}", f"- 原因：{reason}"])
+    lines.extend(f"- {item}" for item in instruction_lines)
+    lines.extend(["", "## 监控", "", f"- {str(monitor['rationale']).strip()}"])
+    return "\n".join(lines).strip()
+
+
+def validate_analysis_record(payload: dict[str, Any], require_rendered: bool = False) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise state.DeskError("analysis_run_record.payload 必须是对象。")
+    rendered = render_analysis_output(payload)
+    if require_rendered and str(payload.get("user_visible_output", "")).strip() != rendered:
+        raise state.DeskError("分析留档缺少程序生成的完整 user_visible_output，不能完成周期。")
+    return {"user_visible_output": rendered}
+
+
+def record_analysis_run(day: str, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    rendered = render_analysis_output(normalized)
+    normalized["user_visible_output"] = rendered
+    conclusion = normalized["conclusion"]
+    normalized["summary"] = str(
+        normalized.get("user_visible_summary")
+        or normalized.get("summary")
+        or conclusion.get("trading_advice")
+    ).strip()
+    path = state.record_run(day, run_id, normalized)
+    return {
+        "path": str(path),
+        "user_visible_output": rendered,
+        "display_contract": "必须在本轮回复中完整输出 user_visible_output；不得只发送 summary。",
+    }
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []

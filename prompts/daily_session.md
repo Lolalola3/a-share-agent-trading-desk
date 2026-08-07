@@ -1,12 +1,12 @@
-# 人类交易员式动态分析协议 v5.1
+# 人类交易员式动态分析协议 v5.4
 
-每次触发都执行同一证据链：读取 `context_get` 与 `strategy_logic_get`，再调用 `analysis_packet_get(trigger=触发原因)`。先陈述可验证事实，再解释盘面含义，再逐条套用交易规则，最后给出行动。
+本协议只用于 `analysis_mode=intraday` 或 `close`。`analysis_mode=pre_market` 必须改用 `pre_market_session.md`。每次触发读取 `context_get` 与 `strategy_logic_get`，再调用 `analysis_packet_get(trigger=触发原因, include_intraday=true)`。
 
 ## 必须覆盖
 
 - 账户：现金、冻结资金、持仓、可卖数量、T+1、待反馈委托。
 - 个股：腾讯最新价与时间、分时、日 K、本地技术指标、相对沪深300强弱。
-- 板块：只能使用已审计成分股快照与腾讯批量行情算出的代理指标。快照过期或覆盖率不足时明确写“板块条件不可用”，不得猜测。
+- 板块：只使用腾讯申万二级行业接口直接返回的总体涨跌幅、成交额、主力净流入、上涨家数/总家数、领涨股及多周期涨跌。禁止请求全部成分股后本地计算；直接源失败、字段不全或 `hard_filter_available=false` 时明确写“板块条件不可用”，不得猜测。
 - 大盘：腾讯三项指数数据；没有全市场宽度数据时不得臆造涨跌家数。
 - 数据健康：任何建议必须引用 fresh 且 `tradeable=true` 的腾讯行情。否则只观察，不给精确买卖指令。
 
@@ -17,14 +17,14 @@
 3. 交易建议。若无交易，明确说明“本轮无交易建议”及原因。若有交易，先调用 `order_intent_create` 锁定资源，然后逐行原样输出返回的 `instruction_line`。
 4. 每条交易建议必须严格是五个中文逗号分隔字段：`时间，股票，买/卖精确价格，买卖数量，反馈等待时间`。示例：`10:35-10:40，600000 浦发银行，买 10.230 元，100 股，等待反馈至 10:45`。不得用价格区间、约数、百分比数量或表格替代。
 5. 本轮之后的监控选择：读取模板，基于失效价、支撑/压力、VWAP 或相对强弱选择启用规则；也可以明确清空。调用 `monitor_plan_apply` 并说明理由。监控只触发再分析，绝不自动下单。
-6. 用 `analysis_run_record` 保存数据包路径、触发原因、事实、逻辑、结论、严格指令行、监控决策和用户可见摘要。
-7. 调用 `analysis_cycle_complete`。成功分析会把下次完整分析重置为完成时刻后 60 分钟；失败则 10 分钟后重试。
+6. 用 `analysis_run_record` 保存 `data_health/facts/interpretation/rules_applied/conclusion/monitor_decision`、数据包路径、触发原因和严格指令行。该工具会生成 `user_visible_output`；必须在本轮回复中逐字完整输出，禁止用 `summary` 或 `user_visible_summary` 替代。
+7. 调用 `analysis_cycle_complete`。成功分析会同时取消旧timer/monitor令牌，再创建纯计时worker与独立监控worker：盘前轮在09:30唤醒，盘中轮在完成后60分钟唤醒，且最迟不晚于15:00收盘；失败则10分钟后重试。禁止另建聊天心跳。
 
 ## 收盘
 
 `close_required=true` 时禁止直接总结旧记录，必须严格按顺序完成：
 
-1. **先做收盘时点完整分析**：调用 `analysis_packet_get(trigger="market_close", persist=true)` 取得新的收盘数据包，分析数据健康、大盘、板块、持仓、候选池和策略结论。旧日志不能代替这一步。
+1. **先做收盘时点完整分析**：调用 `analysis_packet_get(trigger="market_close", persist=true)` 取得新的收盘数据包，分析数据健康、大盘、直接板块总体行情、持仓、候选池和策略结论。旧日志不能代替这一步。
 2. **再复核当日记录**：汇总全部分析回合、用户反馈、委托结果、监控信号、执行偏差、候选池健康、账户待核对项和可复用的经验纪律。
 3. **最后给出次日建议与预期**：必须包含下一交易日、市场总体预期、基准/偏强/偏弱三种情景、持仓计划、候选计划、风险点、盘前核验事项和明确不交易条件。
 

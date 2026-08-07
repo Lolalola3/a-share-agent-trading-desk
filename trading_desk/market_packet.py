@@ -12,29 +12,36 @@ import json
 import math
 import os
 import re
-import shutil
-import subprocess
+import ssl
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
-from . import state
+try:
+    import requests
+except ImportError:  # pragma: no cover - urllib remains the dependency-free fallback
+    requests = None
+
+from . import sector_data, state
 
 
 # China Standard Time has no daylight saving transition.  Using a fixed offset
 # avoids requiring the optional ``tzdata`` wheel on Windows installations.
 SHANGHAI = timezone(timedelta(hours=8), name="Asia/Shanghai")
-USER_AGENT = "StockPet-inspired A-share Trading Desk/0.5.1"
+USER_AGENT = "StockPet-inspired A-share Trading Desk/0.2"
 LATEST_TIMEOUT_SECONDS = 2.5
 SECONDARY_TIMEOUT_SECONDS = 4.5
 INTRADAY_TIMEOUT_SECONDS = 4.5
 HISTORY_TIMEOUT_SECONDS = 4.5
 FRESHNESS_SECONDS = 90
 MAX_PARALLEL_REQUESTS = 6
+PYTHON_HTTP_RETRIES = 1
+_HTTP_LOCAL = threading.local()
 MARKET_BENCHMARKS = {
     "sh000001": "上证指数",
     "sz399001": "深证成指",
@@ -61,6 +68,18 @@ def shanghai_now() -> datetime:
     return datetime.now(SHANGHAI)
 
 
+def intraday_expectation(value: datetime | None = None) -> dict[str, Any]:
+    current = value or shanghai_now()
+    current = current.replace(tzinfo=SHANGHAI) if current.tzinfo is None else current.astimezone(SHANGHAI)
+    if current.strftime("%H:%M") < "09:30":
+        return {
+            "expected": False,
+            "status": "not_expected",
+            "reason": "连续竞价尚未开始；腾讯分时通常不足两个有效分钟点，盘前分析不请求分时。",
+        }
+    return {"expected": True, "status": "expected", "reason": "连续竞价已经开始，应请求腾讯分时。"}
+
+
 def normalize_tencent_code(code: str) -> str:
     normalized = str(code).strip().lower()
     if normalized.startswith(("sh", "sz")):
@@ -76,34 +95,59 @@ def eastmoney_secid(code: str) -> str:
 
 
 def _http_bytes(url: str, timeout: float) -> bytes:
-    # This project's Python transport has shown multi-second tails for Tencent
-    # and TLS EOFs for Eastmoney under the active VPN. Windows-native curl is
-    # already present on supported Windows versions and is materially faster
-    # here. Prefer it for the two fixed public quote hosts with a hard process
-    # timeout. Falling through to urllib after a curl failure caused stacked
-    # DNS waits under VPN, so urllib is now only the no-curl portability path.
-    fixed_market_host = "eastmoney.com" in url or "gtimg.cn" in url
-    if fixed_market_host and (curl := shutil.which("curl.exe") or shutil.which("curl")):
-        try:
-            completed = subprocess.run(
-                [curl, "--silent", "--show-error", "--location", "--connect-timeout", str(max(1, int(timeout))), "--max-time", str(max(2, int(timeout) + 1)), "--user-agent", USER_AGENT, "--output", "-", "--url", url],
-                capture_output=True,
-                check=False,
-                timeout=max(3.0, timeout + 2.0),
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise MarketDataError(f"curl hard timeout after {timeout + 2.0:.1f}s") from exc
-        if completed.returncode == 0 and completed.stdout:
-            return completed.stdout
-        error = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise MarketDataError(f"curl exit {completed.returncode}: {error[:120] or 'empty response'}")
-    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    """Fetch bytes in-process; never create curl.exe or another console child."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Connection": "close",
+    }
+    if requests is not None:
+        session = getattr(_HTTP_LOCAL, "session", None)
+        if session is None:
+            session = requests.Session()
+            # Direct Tencent access is materially faster than Windows' ambient
+            # proxy discovery in this workspace.  No credentials are involved.
+            session.trust_env = False
+            _HTTP_LOCAL.session = session
+        last_error: Exception | None = None
+        for attempt in range(PYTHON_HTTP_RETRIES + 1):
+            try:
+                response = session.get(
+                    url,
+                    headers=headers,
+                    timeout=(max(1.0, timeout), max(2.0, timeout + 1.0)),
+                    allow_redirects=True,
+                )
+                response.raise_for_status()
+                if not response.content:
+                    raise MarketDataError("Python HTTP response was empty")
+                return bytes(response.content)
+            except Exception as exc:
+                last_error = exc
+                if attempt < PYTHON_HTTP_RETRIES:
+                    time.sleep(0.1 * (attempt + 1))
+        assert last_error is not None
+        if isinstance(last_error, MarketDataError):
+            raise last_error
+        detail = str(last_error).strip() or type(last_error).__name__
+        raise MarketDataError(f"Python HTTP {type(last_error).__name__}: {detail[:180]}") from last_error
+
     request = Request(url, headers=headers)
+    context = ssl.create_default_context()
+    if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+        context.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
+    opener = build_opener(ProxyHandler({}), HTTPSHandler(context=context))
     try:
-        with urlopen(request, timeout=timeout) as response:  # nosec B310: fixed public HTTPS endpoints
-            return response.read()
+        with opener.open(request, timeout=timeout) as response:  # nosec B310: fixed public HTTPS endpoints
+            payload = response.read()
+            if not payload:
+                raise MarketDataError("Python HTTP response was empty")
+            return payload
     except Exception as exc:
-        raise MarketDataError(f"{type(exc).__name__}: {exc}") from exc
+        if isinstance(exc, MarketDataError):
+            raise
+        detail = str(exc).strip() or type(exc).__name__
+        raise MarketDataError(f"Python HTTP {type(exc).__name__}: {detail[:180]}") from exc
 
 
 def _parse_timestamp(raw: str | None) -> str | None:
@@ -531,9 +575,15 @@ def parse_eastmoney_intraday(
 
 
 class MarketPacketBuilder:
-    def __init__(self, fetcher: Callable[[str, float], bytes] = _http_bytes, cache_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        fetcher: Callable[[str, float], bytes] = _http_bytes,
+        cache_path: Path | None = None,
+        sector_client: Any | None = None,
+    ) -> None:
         self.fetcher = fetcher
         self.cache_path = cache_path or state.STATE_DIR / "market_cache.json"
+        self.sector_client = sector_client or sector_data.TencentSectorClient()
 
     def _fetch_tencent_latest(self, codes: list[str]) -> dict[str, dict[str, Any]]:
         request_codes = ",".join(normalize_tencent_code(code) for code in codes)
@@ -564,11 +614,14 @@ class MarketPacketBuilder:
                 return {"ok": True, **result}
             raise MarketDataError("腾讯分时没有足够绘图点")
         except Exception as primary_error:
+            detail = str(primary_error).strip() or type(primary_error).__name__
             return {
                 "ok": False,
+                "status": "unavailable",
                 "source": "腾讯分时",
                 "tradeable": False,
-                "error": type(primary_error).__name__,
+                "error_type": type(primary_error).__name__,
+                "error_detail": detail[:240],
                 "policy": "腾讯失败即标记不可用；盘中禁止自动切换非腾讯数据源。",
             }
 
@@ -648,6 +701,10 @@ class MarketPacketBuilder:
         Shanghai calendar day.  Secondary quotes are requested only for
         symbols whose Tencent quote is absent or stale.
         """
+        raise state.DeskError(
+            "固定节点 v2 数据包已停用；请使用 build(trigger=...) 的动态腾讯数据包。"
+        )
+        # Retained below only as a read-only migration reference for old archives.
         if node not in NODE_NAMES:
             raise ValueError(f"未知节点：{node}；可用节点为 {', '.join(NODE_NAMES)}")
         started = time.perf_counter()
@@ -1000,123 +1057,168 @@ class MarketPacketBuilder:
             packet["ephemeral"] = True
         packet["timing"] = {"total_elapsed_ms": round((time.perf_counter() - started) * 1000)}
         return packet
+    @staticmethod
+    def _runtime_config() -> dict[str, Any]:
+        config_path = state.ROOT / "config" / "runtime.json"
+        try:
+            return json.loads(config_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _fetch_tencent_latest_batched_profile(self, codes: list[str]) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        """Fetch bounded Tencent quote batches concurrently and keep per-batch evidence."""
+        cfg = self._runtime_config()
+        try:
+            batch_size = max(1, int(cfg.get("tencent_batch_size", 50)))
+            max_workers = max(1, int(cfg.get("tencent_batch_workers", 4)))
+        except (TypeError, ValueError):
+            batch_size, max_workers = 50, 4
+        unique_codes = list(dict.fromkeys(str(code) for code in codes))
+        batches = [unique_codes[start:start + batch_size] for start in range(0, len(unique_codes), batch_size)]
+        result: dict[str, dict[str, Any]] = {}
+        batch_rows: list[dict[str, Any]] = []
+        started = time.perf_counter()
+        if batches:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
+                futures = {}
+                for index, batch in enumerate(batches, start=1):
+                    batch_started = time.perf_counter()
+                    future = executor.submit(self._fetch_tencent_latest, batch)
+                    futures[future] = (index, batch, batch_started)
+                for future in as_completed(futures):
+                    index, batch, batch_started = futures[future]
+                    try:
+                        fetched = future.result()
+                        result.update(fetched)
+                        batch_rows.append({
+                            "batch": index,
+                            "requested": len(batch),
+                            "returned": len(fetched),
+                            "elapsed_ms": round((time.perf_counter() - batch_started) * 1000),
+                            "status": "online" if len(fetched) == len(batch) else "partial",
+                            "codes": batch,
+                        })
+                    except Exception as exc:
+                        batch_rows.append({
+                            "batch": index,
+                            "requested": len(batch),
+                            "returned": 0,
+                            "elapsed_ms": round((time.perf_counter() - batch_started) * 1000),
+                            "status": "offline",
+                            "error_type": type(exc).__name__,
+                            "error_detail": str(exc)[:240],
+                            "codes": batch,
+                        })
+        batch_rows.sort(key=lambda item: item["batch"])
+        failures = [code for item in batch_rows if item["status"] == "offline" for code in item["codes"]]
+        profile = {
+            "status": "online" if unique_codes and len(result) == len(unique_codes) else "degraded" if result else "offline",
+            "requested_symbols": len(unique_codes),
+            "returned_symbols": len(result),
+            "coverage": round(len(result) / len(unique_codes), 4) if unique_codes else 1.0,
+            "batch_size": batch_size,
+            "batch_count": len(batches),
+            "workers": min(max_workers, len(batches)) if batches else 0,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000),
+            "failed_codes": failures,
+            "batches": batch_rows,
+        }
+        return result, profile
 
     def _fetch_tencent_latest_batched(self, codes: list[str]) -> dict[str, dict[str, Any]]:
-        """Fetch Tencent quotes in bounded batches, preserving raw six-digit keys."""
-        config_path = state.PACKAGE_ROOT / "config" / "runtime.json"
-        try:
-            batch_size = max(1, int(json.loads(config_path.read_text(encoding="utf-8")).get("tencent_batch_size", 50)))
-        except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
-            batch_size = 50
-        unique_codes = list(dict.fromkeys(str(code) for code in codes))
-        result: dict[str, dict[str, Any]] = {}
-        for start in range(0, len(unique_codes), batch_size):
-            result.update(self._fetch_tencent_latest(unique_codes[start:start + batch_size]))
-        return result
+        """Compatibility wrapper for callers that only need the quote mapping."""
+        return self._fetch_tencent_latest_batched_profile(codes)[0]
 
-    @staticmethod
-    def _median(values: list[float]) -> float | None:
-        if not values:
-            return None
-        ordered = sorted(values)
-        middle = len(ordered) // 2
-        if len(ordered) % 2:
-            return ordered[middle]
-        return (ordered[middle - 1] + ordered[middle]) / 2
+    def _fetch_direct_sector_snapshot(self, sector_names: set[str]) -> dict[str, Any]:
+        if not sector_names:
+            return {
+                "status": "not_requested",
+                "source": "腾讯申万二级行业总体行情",
+                "sectors": [],
+                "requested_sectors": 0,
+                "available_sectors": 0,
+                "elapsed_ms": 0,
+            }
+        try:
+            return self.sector_client.fetch_direct_summary(sorted(sector_names))
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "source": "腾讯申万二级行业总体行情",
+                "sectors": [],
+                "requested_sectors": len(sector_names),
+                "available_sectors": 0,
+                "hard_filter_eligible_sectors": 0,
+                "elapsed_ms": 0,
+                "error_type": type(exc).__name__,
+                "error_detail": str(exc)[:240],
+            }
 
     def _sector_context(
         self,
-        universe: dict[str, Any],
-        tracked_codes: set[str],
         tracked_sector_names: set[str],
-        quotes: dict[str, dict[str, Any]],
         now: datetime,
+        direct_snapshot: dict[str, Any] | None = None,
+        market_date_confirmed: bool = False,
     ) -> dict[str, Any]:
-        """Compute sector proxies only from audited membership + Tencent quotes."""
-        config_path = state.PACKAGE_ROOT / "config" / "runtime.json"
-        try:
-            cfg = json.loads(config_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
-            cfg = {}
-        coverage_min = float(cfg.get("sector_quote_coverage_min", 0.8))
-        max_age_days = int(cfg.get("sector_universe_max_age_days", 8))
-        if universe.get("status") != "active" or not universe.get("sectors"):
-            return {
-                "status": "unavailable",
-                "reason": "没有已审计的板块成分快照。",
-                "trade_rule": "板块硬条件不可用，不得据此生成买入建议。",
-                "sectors": [],
-            }
-        try:
-            as_of = datetime.fromisoformat(str(universe["as_of"])).date()
-            valid_until = datetime.fromisoformat(str(universe["valid_until"])).date()
-            age_days = (now.date() - as_of).days
-        except (KeyError, TypeError, ValueError):
-            return {"status": "unavailable", "reason": "板块快照日期无效。", "sectors": []}
-        if age_days < 0 or age_days > max_age_days or now.date() > valid_until:
-            return {
-                "status": "stale",
-                "reason": f"板块快照已过期或超过 {max_age_days} 天。",
-                "as_of": universe.get("as_of"),
-                "valid_until": universe.get("valid_until"),
-                "sectors": [],
-            }
-        relevant = []
-        for sector in universe.get("sectors", []):
-            member_codes = {str(member.get("code")) for member in sector.get("constituents", [])}
-            if sector.get("name") in tracked_sector_names or member_codes.intersection(tracked_codes):
-                relevant.append(sector)
-        sector_rows = []
-        for sector in relevant:
-            members = list(sector.get("constituents", []))
-            usable = []
-            for member in members:
-                code = str(member.get("code"))
-                quote = quotes.get(code) or {}
-                if quote.get("tradeable") and quote.get("change_pct") is not None:
-                    usable.append({"code": code, "name": member.get("name", ""), "quote": quote})
-            coverage = len(usable) / len(members) if members else 0.0
-            changes = [float(item["quote"]["change_pct"]) for item in usable]
-            passed = coverage >= coverage_min
-            ranked = sorted(usable, key=lambda item: item["quote"]["change_pct"], reverse=True)
-            tracked_ranks = [
-                {
-                    "code": item["code"],
-                    "rank": index,
-                    "of": len(ranked),
-                    "change_pct": item["quote"]["change_pct"],
-                }
-                for index, item in enumerate(ranked, start=1)
-                if item["code"] in tracked_codes
-            ]
-            amount_values = [
-                float(item["quote"]["amount_cny"])
-                for item in usable
-                if item["quote"].get("amount_cny") is not None
-            ]
-            sector_rows.append({
-                "name": sector.get("name"),
-                "status": "ready" if passed else "insufficient_coverage",
-                "constituents": len(members),
-                "fresh_tencent_quotes": len(usable),
-                "quote_coverage": round(coverage, 4),
-                "coverage_required": coverage_min,
-                "equal_weight_mean_change_pct": _round(sum(changes) / len(changes)) if passed and changes else None,
-                "median_change_pct": _round(self._median(changes)) if passed and changes else None,
-                "advance_ratio": _round(sum(value > 0 for value in changes) / len(changes), 4) if passed and changes else None,
-                "amount_coverage": round(len(amount_values) / len(members), 4) if members else 0.0,
-                "observed_amount_cny": _round(sum(amount_values), 2) if amount_values else None,
-                "tracked_stock_ranks": tracked_ranks,
+        """Normalize source-provided sector aggregates; never load constituents."""
+        direct_snapshot = direct_snapshot or {}
+        direct_by_name = {
+            str(item.get("name")): item
+            for item in direct_snapshot.get("sectors", [])
+            if item.get("name")
+        }
+        rows = []
+        for name in sorted(tracked_sector_names):
+            direct = direct_by_name.get(name) or {}
+            advancers = direct.get("advancers")
+            constituent_count = direct.get("constituent_count")
+            eligible = bool(direct.get("hard_filter_eligible")) and market_date_confirmed
+            reason = direct.get("reason") or "板块总体数据不可用。"
+            if direct.get("hard_filter_eligible") and not market_date_confirmed:
+                reason = "腾讯指数未确认当前交易日，直接板块总体数据只能作背景。"
+            rows.append({
+                "name": name,
+                "status": "ready" if eligible else str(direct.get("status") or "unavailable"),
+                "source": direct_snapshot.get("source", "腾讯申万二级行业总体行情"),
+                "source_sector_code": direct.get("source_sector_code"),
+                "captured_at": direct_snapshot.get("captured_at"),
+                "data_as_of": direct_snapshot.get("data_as_of"),
+                "date_basis": direct_snapshot.get("date_basis"),
+                "change_pct": direct.get("change_pct"),
+                "turnover_100m_cny": direct.get("turnover_100m_cny"),
+                "net_flow_100m_cny": direct.get("net_flow_100m_cny"),
+                "advancers": advancers,
+                "constituent_count": constituent_count,
+                "non_advancers": direct.get("non_advancers"),
+                "advance_ratio": direct.get("advance_ratio"),
+                "leader": direct.get("leader"),
+                "leader_code": direct.get("leader_code"),
+                "leader_price": direct.get("leader_price"),
+                "leader_change_pct": direct.get("leader_change_pct"),
+                "return_5d_pct": direct.get("return_5d_pct"),
+                "return_20d_pct": direct.get("return_20d_pct"),
+                "return_60d_pct": direct.get("return_60d_pct"),
+                "return_52w_pct": direct.get("return_52w_pct"),
+                "return_ytd_pct": direct.get("return_ytd_pct"),
+                "hard_filter_available": eligible,
+                "reason": reason,
             })
-        ready = sum(item["status"] == "ready" for item in sector_rows)
+        ready = sum(item["hard_filter_available"] for item in rows)
         return {
-            "status": "ready" if sector_rows and ready == len(sector_rows) else "degraded" if ready else "unavailable",
-            "method": "审计成分股快照 + 腾讯批量实时行情的等权代理",
-            "membership_as_of": universe.get("as_of"),
-            "membership_valid_until": universe.get("valid_until"),
-            "sources": universe.get("sources", []),
-            "sectors": sector_rows,
-            "warning": "这不是第三方板块实时接口；覆盖率不足时板块硬条件不可用。",
+            "status": "ready" if rows and ready == len(rows) else "degraded" if ready else "unavailable",
+            "hard_filter_status": "ready" if rows and ready == len(rows) else "degraded" if ready else "unavailable",
+            "method": "直接读取数据源的板块总体行情；不抓取成分股，不做本地板块行情计算",
+            "source": direct_snapshot.get("source", "腾讯申万二级行业总体行情"),
+            "captured_at": direct_snapshot.get("captured_at"),
+            "data_as_of": direct_snapshot.get("data_as_of"),
+            "date_basis": direct_snapshot.get("date_basis"),
+            "requested_sectors": len(rows),
+            "available_sectors": sum(item.get("status") != "unavailable" for item in rows),
+            "hard_filter_eligible_sectors": ready,
+            "market_date_confirmed_by_tencent_index": market_date_confirmed,
+            "sectors": rows,
+            "trade_rule": "仅 hard_filter_available=true 的直接板块总体数据可用于板块硬条件；失败或盘前时冻结依赖板块条件的新买入。",
         }
 
     def monitor_snapshot(self, codes: list[str]) -> dict[str, dict[str, Any]]:
@@ -1142,13 +1244,12 @@ class MarketPacketBuilder:
         return result
 
     def build(self, trigger: str = "manual", include_intraday: bool = True, persist: bool = True) -> dict[str, Any]:
-        """Build a dynamic Tencent-only decision packet (workflow v5)."""
+        """Build a dynamic decision packet with direct sector aggregates."""
         started = time.perf_counter()
         now = shanghai_now()
         today = now.date().isoformat()
         trigger = str(trigger or "manual")
         account, watchlist = state.get_account(), state.get_watchlist()
-        universe = state.get_sector_universe()
         positions = list(account.get("positions", []))
         candidates = list(watchlist.get("candidates", []))
         position_by_code = {str(item["code"]): item for item in positions}
@@ -1164,39 +1265,48 @@ class MarketPacketBuilder:
             })
         tracked_codes = list(identities)
         tracked_sectors = {str(item.get("sector")) for item in identities.values() if item.get("sector")}
-        relevant_sector_members: list[str] = []
-        tracked_set = set(tracked_codes)
-        for sector in universe.get("sectors", []):
-            members = [str(item.get("code")) for item in sector.get("constituents", [])]
-            if sector.get("name") in tracked_sectors or tracked_set.intersection(members):
-                relevant_sector_members.extend(members)
         benchmark_codes = list(MARKET_BENCHMARKS)
-        all_quote_codes = list(dict.fromkeys(tracked_codes + relevant_sector_members + benchmark_codes))
+        core_quote_codes = list(dict.fromkeys(tracked_codes + benchmark_codes))
         cache = self._load_cache()
         source_health: list[dict[str, Any]] = []
-        quote_started = time.perf_counter()
-        try:
-            fetched = self._fetch_tencent_latest_batched(all_quote_codes)
-            source_health.append({
-                "name": "腾讯批量实时行情", "status": "online", "symbols": len(fetched),
-                "requested_symbols": len(all_quote_codes),
-                "elapsed_ms": round((time.perf_counter() - quote_started) * 1000),
-            })
-        except Exception as exc:
-            fetched = {}
-            source_health.append({
-                "name": "腾讯批量实时行情", "status": "offline", "symbols": 0,
-                "requested_symbols": len(all_quote_codes), "error": f"{type(exc).__name__}: {str(exc)[:120]}",
-                "elapsed_ms": round((time.perf_counter() - quote_started) * 1000),
-            })
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            quote_future = executor.submit(self._fetch_tencent_latest_batched_profile, core_quote_codes)
+            direct_future = executor.submit(self._fetch_direct_sector_snapshot, tracked_sectors)
+            try:
+                fetched, quote_profile = quote_future.result()
+            except Exception as exc:
+                fetched = {}
+                quote_profile = {
+                    "status": "offline", "requested_symbols": len(core_quote_codes), "returned_symbols": 0,
+                    "coverage": 0.0, "elapsed_ms": 0, "failed_codes": core_quote_codes,
+                    "error_type": type(exc).__name__, "error_detail": str(exc)[:240],
+                }
+            direct_sector_snapshot = direct_future.result()
+        source_health.append({
+            "name": "腾讯核心批量实时行情",
+            "status": quote_profile["status"],
+            "symbols": quote_profile["returned_symbols"],
+            **quote_profile,
+        })
         source_health.append({
             "name": "非腾讯盘中实时源", "status": "disabled", "symbols": 0,
-            "policy": "不会调用东方财富、同花顺或 DangInvest 作为自动回退。",
+            "policy": "个股、指数和板块均不自动切换到非腾讯源。",
+        })
+        source_health.append({
+            "name": direct_sector_snapshot.get("source", "腾讯申万二级行业总体行情"),
+            "status": direct_sector_snapshot.get("status", "unavailable"),
+            "symbols": direct_sector_snapshot.get("available_sectors", 0),
+            "requested_symbols": direct_sector_snapshot.get("requested_sectors", len(tracked_sectors)),
+            "elapsed_ms": direct_sector_snapshot.get("elapsed_ms", 0),
+            "source_reported_eligible_symbols": direct_sector_snapshot.get("hard_filter_eligible_sectors", 0),
+            "method": direct_sector_snapshot.get("method"),
+            "error_type": direct_sector_snapshot.get("error_type"),
+            "error_detail": direct_sector_snapshot.get("error_detail"),
         })
         cached_quotes = cache.get("quotes") or {}
         quotes = {
             code: self._combined_quote(code, fetched.get(code), None, cached_quotes.get(code), now)
-            for code in list(dict.fromkeys(tracked_codes + relevant_sector_members))
+            for code in tracked_codes
         }
         benchmark_quotes = {
             full[2:]: self._combined_quote(full[2:], fetched.get(full[2:]), None, (cache.get("market") or {}).get(full[2:]), now)
@@ -1238,7 +1348,20 @@ class MarketPacketBuilder:
         })
 
         intraday: dict[str, Any] = {}
-        if include_intraday and tracked_codes:
+        intraday_policy = intraday_expectation(now)
+        effective_include_intraday = bool(include_intraday and intraday_policy["expected"])
+        if not intraday_policy["expected"]:
+            intraday = {
+                code: {
+                    "ok": False,
+                    "status": "not_expected",
+                    "source": "腾讯分时",
+                    "tradeable": False,
+                    "reason": intraday_policy["reason"],
+                }
+                for code in tracked_codes
+            }
+        elif effective_include_intraday and tracked_codes:
             with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_REQUESTS, len(tracked_codes))) as executor:
                 futures = {executor.submit(self._fetch_intraday, code, quotes.get(code)): code for code in tracked_codes}
                 for future in as_completed(futures):
@@ -1246,10 +1369,33 @@ class MarketPacketBuilder:
                     try:
                         intraday[code] = future.result()
                     except Exception as exc:
-                        intraday[code] = {"ok": False, "source": "腾讯分时", "error": type(exc).__name__}
+                        intraday[code] = {
+                            "ok": False,
+                            "status": "unavailable",
+                            "source": "腾讯分时",
+                            "tradeable": False,
+                            "error_type": type(exc).__name__,
+                            "error_detail": str(exc)[:240],
+                        }
+        intraday_status = (
+            "not_expected"
+            if not intraday_policy["expected"]
+            else "not_requested"
+            if not include_intraday
+            else "online"
+            if any(item.get("ok") for item in intraday.values())
+            else "offline"
+        )
         source_health.append({
-            "name": "腾讯分时", "status": "online" if any(item.get("ok") for item in intraday.values()) else "not_requested" if not include_intraday else "offline",
+            "name": "腾讯分时", "status": intraday_status,
             "symbols": sum(bool(item.get("ok")) for item in intraday.values()),
+            "requested": effective_include_intraday,
+            "reason": intraday_policy["reason"] if intraday_status == "not_expected" else None,
+            "errors": [
+                {"code": code, "type": item.get("error_type"), "detail": item.get("error_detail")}
+                for code, item in intraday.items()
+                if item.get("status") == "unavailable"
+            ][:8],
         })
 
         benchmark_rows = []
@@ -1277,6 +1423,11 @@ class MarketPacketBuilder:
             "benchmarks": benchmark_rows,
             "scope_note": "仅以腾讯指数行情判断大盘环境，不臆造全市场宽度。",
         }
+        market_date_confirmed = any(
+            str((item.get("quote") or {}).get("quote_timestamp") or "").startswith(today)
+            for item in benchmark_rows
+        )
+        market_context["trade_date_confirmed"] = market_date_confirmed
         csi = next((item for item in benchmark_rows if item["code"] == "000300"), {})
         csi_change = (csi.get("quote") or {}).get("change_pct")
         csi_5d = (csi.get("technical") or {}).get("return_5d_pct")
@@ -1302,22 +1453,36 @@ class MarketPacketBuilder:
                 candidate = candidate_by_code[code]
                 row["candidate"] = dict(candidate)
             rows.append(row)
-        sector_context = self._sector_context(universe, set(tracked_codes), tracked_sectors, quotes, now)
+        sector_context = self._sector_context(
+            tracked_sectors,
+            now,
+            direct_snapshot=direct_sector_snapshot,
+            market_date_confirmed=market_date_confirmed,
+        )
         for row in rows:
-            row["sector_proxy"] = next((item for item in sector_context.get("sectors", []) if item.get("name") == row.get("sector")), None)
+            row["sector_market"] = next((item for item in sector_context.get("sectors", []) if item.get("name") == row.get("sector")), None)
         tradeable_count = sum(bool(item["quote"].get("tradeable")) for item in rows)
         packet = {
-            "schema_version": 3,
+            "schema_version": 5,
             "kind": "dynamic_market_packet",
             "trigger": trigger,
             "trigger_name": ANALYSIS_TRIGGERS.get(trigger, "自定义触发"),
             "generated_at": now.isoformat(timespec="seconds"),
             "freshness_requirement_seconds": FRESHNESS_SECONDS,
-            "scope": {"holdings": len(positions), "candidates": len(candidates), "tracked_symbols": len(rows), "sector_proxy_symbols": len(set(relevant_sector_members))},
+            "scope": {
+                "holdings": len(positions),
+                "candidates": len(candidates),
+                "tracked_symbols": len(rows),
+                "sector_direct_symbols": len(tracked_sectors),
+            },
             "source_policy": {
                 "intraday_primary": "腾讯",
+                "intraday_expected": intraday_policy["expected"],
+                "intraday_expectation_reason": intraday_policy["reason"],
                 "automatic_fallback": False,
                 "on_tencent_failure": "标记不可交易并等待下次刷新",
+                "sector_mode": "直接板块总体行情；不请求成分股，不做本地计算",
+                "direct_sector_hard_filter_eligible": sector_context.get("hard_filter_eligible_sectors", 0),
             },
             "source_health": source_health,
             "market_context": market_context,
@@ -1328,7 +1493,11 @@ class MarketPacketBuilder:
             "summary": {
                 "tradeable_quotes": tradeable_count,
                 "unavailable_or_stale_quotes": len(rows) - tradeable_count,
-                "instruction": "只有腾讯 fresh 且 tradeable=true 的个股可生成精确交易建议；板块覆盖不足时板块硬条件不可用。",
+                "instruction": (
+                    "盘前只使用腾讯集合竞价报价、前一交易日日K和账户状态；不使用分时、VWAP、量比或盘中入场逻辑。"
+                    if not intraday_policy["expected"]
+                    else "只有腾讯 fresh 且 tradeable=true 的个股可生成精确交易建议；直接板块总体数据失败或字段不完整时板块硬条件不可用。"
+                ),
             },
             "timing": {"total_elapsed_ms": round((time.perf_counter() - started) * 1000)},
         }

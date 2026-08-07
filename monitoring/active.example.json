@@ -1,16 +1,16 @@
 {
-  "day": "2026-01-05",
-  "rationale": "示例：等待观察股突破压力位，或持仓跌破风险线时重新分析。",
+  "day": "2026-08-06",
+  "rationale": "示例：等待候选突破压力位，或持仓跌破风险线时重新分析。",
   "monitors": [
     {
       "template_id": "price_breakout",
-      "code": "600000",
-      "name": "示例股票",
-      "threshold": 10.0,
-      "rearm_delta": 0.05,
+      "code": "000400",
+      "name": "许继电气",
+      "threshold": 23.74,
+      "rearm_delta": 0.10,
       "cooldown_minutes": 30,
-      "expires_at": "2026-01-05T15:00:00+08:00",
-      "note": "信号只触发重新分析，不代表自动买入。"
+      "expires_at": "2026-08-06T15:00:00+08:00",
+      "note": "突破候选池压力位后重新评估，不代表自动买入。"
     }
   ]
 }

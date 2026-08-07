@@ -1,0 +1,15 @@
+{
+  "schema_version": 3,
+  "direct_source": {
+    "enabled": true,
+    "source": "tencent_shenwan_level2_rank",
+    "timeout_seconds": 6.0,
+    "max_attempts": 1,
+    "hard_filter_start_time": "09:30",
+    "board_type": "hy2",
+    "row_limit": 200
+  },
+  "sector_aliases": {
+    "种植业与林业": "种植业"
+  }
+}

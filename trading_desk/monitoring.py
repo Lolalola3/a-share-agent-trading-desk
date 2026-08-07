@@ -17,7 +17,7 @@ def shanghai_now() -> datetime:
 
 
 def templates_path() -> Path:
-    return state.PACKAGE_ROOT / "monitoring" / "templates.json"
+    return state.ROOT / "monitoring" / "templates.json"
 
 
 def plan_path(day: str) -> Path:

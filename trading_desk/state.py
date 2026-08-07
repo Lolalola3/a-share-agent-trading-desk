@@ -8,8 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-ROOT = Path(os.environ.get("A_SHARE_DESK_HOME", str(PACKAGE_ROOT))).expanduser().resolve()
+ROOT = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT / "state"
 RECORDS_DIR = ROOT / "records"
 JOURNAL_DIR = ROOT / "journal"
@@ -19,7 +18,6 @@ SETTINGS_PATH = STATE_DIR / "settings.json"
 # Deprecated compatibility constant.  The dynamic runtime does not read or
 # expose these fixed nodes; old journal records may still contain them.
 SESSION_SCHEDULE = ["09:08", "09:22", "10:30", "11:25", "13:00", "14:25", "14:50", "15:05"]
-SECTOR_UNIVERSE_PATH = STATE_DIR / "sector_universe.json"
 DISPATCH_CLAIM_LEASE_SECONDS = 180
 
 
@@ -64,12 +62,14 @@ def default_settings() -> dict[str, Any]:
         "replacement_score_gap": 15,
         "allowed_code_prefixes": ["600", "601", "603", "605", "000", "001", "002", "003"],
         "analysis_runtime": {
-            "mode": "first_open_then_resettable_timer",
+            "mode": "first_open_then_split_local_timer_monitor",
             "analysis_interval_minutes": 60,
-            "heartbeat_interval_minutes": 5,
+            "earliest_analysis_time": "09:15",
+            "pre_market_end_time": "09:30",
+            "local_monitor_poll_seconds": 30,
         },
         "mandatory_context_days": 5,
-        "prompt_workflow_version": "5.1.0",
+        "prompt_workflow_version": "5.4.0",
         "candidate_pool": {
             "frequency": "每周日 17:00，必要时盘后应急重筛",
             "sector_count": 5,
@@ -164,7 +164,23 @@ def save_account(account: dict[str, Any]) -> None:
 
 
 def get_settings() -> dict[str, Any]:
-    return _read_json(SETTINGS_PATH, default_settings())
+    defaults = default_settings()
+    saved = _read_json(SETTINGS_PATH, {}) or {}
+    settings = {**defaults, **saved}
+    settings["analysis_runtime"] = {**defaults["analysis_runtime"], **dict(saved.get("analysis_runtime") or {})}
+    runtime_settings = settings["analysis_runtime"]
+    runtime_settings.pop("heartbeat_interval_minutes", None)
+    if runtime_settings.get("mode") in {
+        "first_open_then_resettable_timer",
+        "first_open_then_resettable_heartbeat",
+        "first_open_then_local_resettable_wakeup",
+    }:
+        runtime_settings["mode"] = defaults["analysis_runtime"]["mode"]
+    settings["candidate_pool"] = {**defaults["candidate_pool"], **dict(saved.get("candidate_pool") or {})}
+    settings["prompt_workflow_version"] = defaults["prompt_workflow_version"]
+    if saved and settings != saved:
+        _write_json(SETTINGS_PATH, settings)
+    return settings
 
 
 def get_watchlist() -> dict[str, Any]:
@@ -188,111 +204,6 @@ def get_task_session(day: str) -> dict[str, Any]:
     if session is None:
         return {"day": day, "status": "missing", "thread_id": None, "host_id": None}
     return session
-
-
-def get_sector_universe() -> dict[str, Any]:
-    return _read_json(STATE_DIR / "sector_universe.json", {
-        "schema_version": 1,
-        "status": "empty",
-        "as_of": None,
-        "valid_until": None,
-        "updated_at": None,
-        "sources": [],
-        "sectors": [],
-    })
-
-
-def update_sector_universe(
-    sectors: list[dict[str, Any]],
-    sources: list[dict[str, Any]],
-    as_of: str,
-    valid_until: str,
-    rationale: str,
-) -> dict[str, Any]:
-    """Persist an audited sector-constituent snapshot for Tencent proxy math.
-
-    This function never fetches a sector source.  The weekly screening Agent
-    must submit the exact observed source timestamps and constituent codes.
-    Intraday code only consumes this immutable snapshot.
-    """
-    if not 1 <= len(sectors) <= 5:
-        raise DeskError("板块快照必须包含 1 至 5 个板块。")
-    if date.fromisoformat(valid_until) < date.fromisoformat(as_of):
-        raise DeskError("板块快照有效期不能早于数据日期。")
-    if not sources:
-        raise DeskError("板块快照缺少可审计的数据来源。")
-    normalized_sources = []
-    for source in sources:
-        required = ("name", "captured_at", "data_as_of", "status", "completeness_ratio", "consecutive_successes")
-        if any(field not in source or source.get(field) is None or source.get(field) == "" for field in required):
-            raise DeskError("板块来源必须包含名称、时点、数据日期、状态、完整度和连续成功次数。")
-        try:
-            captured_at = datetime.fromisoformat(str(source["captured_at"]))
-            source_day = date.fromisoformat(str(source["data_as_of"]))
-            completeness = float(source["completeness_ratio"])
-            consecutive_successes = int(source["consecutive_successes"])
-        except (TypeError, ValueError) as exc:
-            raise DeskError("板块来源的日期、完整度或连续成功次数格式无效。") from exc
-        if captured_at.tzinfo is None:
-            raise DeskError("板块来源 captured_at 必须包含时区。")
-        status = str(source["status"])
-        if status not in {"online", "degraded", "offline"}:
-            raise DeskError("板块来源状态必须是 online、degraded 或 offline。")
-        if status == "online" and (
-            source_day != date.fromisoformat(as_of)
-            or completeness < 0.95
-            or consecutive_successes < 2
-        ):
-            raise DeskError("online 板块来源必须同日、完整度至少95%，且连续成功至少2次。")
-        normalized_sources.append({
-            "name": str(source["name"]),
-            "captured_at": captured_at.isoformat(timespec="seconds"),
-            "data_as_of": source_day.isoformat(),
-            "status": status,
-            "completeness_ratio": round(completeness, 4),
-            "consecutive_successes": consecutive_successes,
-            "note": str(source.get("note", "")),
-        })
-    if not any(item["status"] == "online" for item in normalized_sources):
-        raise DeskError("板块快照至少需要一个状态为 online 的已核验来源。")
-    normalized_sectors = []
-    seen_names: set[str] = set()
-    for item in sectors:
-        name = str(item.get("name", "")).strip()
-        if not name or name in seen_names:
-            raise DeskError("板块名称不能为空或重复。")
-        seen_names.add(name)
-        raw_constituents = item.get("constituents")
-        if not isinstance(raw_constituents, list) or len(raw_constituents) < 3:
-            raise DeskError(f"板块 {name} 至少需要 3 只成分股。")
-        constituents = []
-        seen_codes: set[str] = set()
-        for member in raw_constituents:
-            code = str(member.get("code", ""))
-            if not _is_mainboard_code(code):
-                raise DeskError(f"{name} 的成分股 {code} 不在沪深主板范围。")
-            if code in seen_codes:
-                raise DeskError(f"{name} 的成分股 {code} 重复。")
-            seen_codes.add(code)
-            constituents.append({"code": code, "name": str(member.get("name", ""))})
-        normalized_sectors.append({
-            "name": name,
-            "constituents": constituents,
-            "constituent_count": len(constituents),
-        })
-    payload = {
-        "schema_version": 1,
-        "status": "active",
-        "as_of": as_of,
-        "valid_until": valid_until,
-        "updated_at": shanghai_now().isoformat(timespec="seconds"),
-        "rationale": str(rationale),
-        "sources": normalized_sources,
-        "sectors": normalized_sectors,
-    }
-    _write_json(STATE_DIR / "sector_universe.json", payload)
-    append_daily(as_of, "sector_universe_updated", payload)
-    return payload
 
 
 def _node_execution_path(day: str, node: str) -> Path:
@@ -957,7 +868,6 @@ def append_daily(day: str, event_type: str, payload: dict[str, Any]) -> Path:
         "day_rollover": "交易日滚动",
         "watchlist_updated": "候选池更新",
         "watchlist_health": "候选池健康检查",
-        "sector_universe_updated": "板块成分快照更新",
         "market_run": "盘面分析",
     }
     with path.open("a", encoding="utf-8") as handle:
@@ -979,7 +889,12 @@ def record_run(day: str, run_id: str, payload: dict[str, Any]) -> Path:
     timestamp = shanghai_now().strftime("%H%M%S")
     path = RECORDS_DIR / "runs" / day / f"{timestamp}_{run_id}.json"
     _write_json(path, payload)
-    append_daily(day, "market_run", {"run_id": run_id, "path": str(path), "summary": payload.get("summary", "")})
+    append_daily(day, "market_run", {
+        "run_id": run_id,
+        "path": str(path),
+        "summary": payload.get("user_visible_summary") or payload.get("summary", ""),
+        "analysis_logic": payload.get("user_visible_output", ""),
+    })
     return path
 
 
@@ -987,7 +902,6 @@ def context_pack(day: str | None = None) -> dict[str, Any]:
     account = get_account()
     settings = get_settings()
     watchlist = get_watchlist()
-    sector_universe = get_sector_universe()
     current_day = day or account["as_of"]
     daily_files = sorted((JOURNAL_DIR / "daily").glob("*.md"), reverse=True)[:settings["mandatory_context_days"]]
     return {
@@ -995,7 +909,6 @@ def context_pack(day: str | None = None) -> dict[str, Any]:
         "account": account,
         "settings": settings,
         "watchlist": watchlist,
-        "sector_universe": sector_universe,
         "task_session": get_task_session(current_day),
         "candidate_pool_policy": {
             "frequency": settings["candidate_pool"]["frequency"],
